@@ -197,6 +197,37 @@ def transition_jira(runner: Runner, config: Config, issue: str, status: str) -> 
     return payload if isinstance(payload, dict) else {"raw": payload, "status": status}
 
 
+def _pr_item_references_issue(item: dict[str, Any], issue: str) -> bool:
+    key = issue.casefold()
+    title = str(item.get("title") or "").casefold()
+    branch = str(item.get("headRefName") or "").casefold()
+    return key in title or key in branch
+
+
+def _list_open_prs_in_repo(
+    runner: Runner,
+    config: Config,
+    repo: str,
+    *,
+    search: str | None,
+) -> list[dict[str, Any]]:
+    argv = [
+        config.gh_bin,
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--json",
+        "number,title,url,headRefName,headRefOid,baseRefName,isDraft,state",
+    ]
+    if search:
+        argv.extend(["--search", search])
+    payload = _json_command(runner, argv, allow=(0, 1))
+    return [item for item in (payload or []) if isinstance(item, dict)]
+
+
 def github_pr_search_query(config: Config, issue: str) -> str:
     """Build the `gh search prs` query for an issue key."""
 
@@ -246,27 +277,15 @@ def search_prs(runner: Runner, config: Config, issue: str) -> list[dict[str, Any
                 }
             )
     if config.github_repo:
-        listed = _json_command(
-            runner,
-            [
-                config.gh_bin,
-                "pr",
-                "list",
-                "--repo",
-                config.github_repo,
-                "--search",
-                issue,
-                "--state",
-                "open",
-                "--json",
-                "number,title,url,headRefName,headRefOid,baseRefName,isDraft,state",
-            ],
-            allow=(0, 1),
-        )
+        listed = _list_open_prs_in_repo(runner, config, config.github_repo, search=issue)
+        if not listed:
+            listed = [
+                item
+                for item in _list_open_prs_in_repo(runner, config, config.github_repo, search=None)
+                if _pr_item_references_issue(item, issue)
+            ]
         owner, repo = config.github_repo.split("/", 1)
-        for item in listed or []:
-            if not isinstance(item, dict):
-                continue
+        for item in listed:
             found.append(
                 {
                     "owner": owner,
