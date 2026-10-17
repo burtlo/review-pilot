@@ -73,10 +73,11 @@ def _json_command(runner: Runner, argv: list[str], *, allow: tuple[int, ...] = (
             for token in ("http 403", "http 404", "http 503", "advanced security", "unavailable")
         )
         raise _result_error(result, unavailable=unavailable)
-    if not result.stdout.strip():
+    stdout = result.stdout or ""
+    if not stdout.strip():
         return None
     try:
-        return parse_json_output(result.stdout)
+        return parse_json_output(stdout)
     except json.JSONDecodeError as exc:
         raise ToolError(f"Could not parse JSON from {' '.join(argv)}: {exc}") from exc
 
@@ -196,40 +197,54 @@ def transition_jira(runner: Runner, config: Config, issue: str, status: str) -> 
     return payload if isinstance(payload, dict) else {"raw": payload, "status": status}
 
 
+def github_pr_search_query(config: Config, issue: str) -> str:
+    """Build the `gh search prs` query for an issue key."""
+
+    if config.github_org and config.github_user:
+        raise ToolError("Set only one of github_org or github_user in .review-ticket.yaml.")
+    if config.github_org:
+        return f"{issue} org:{config.github_org}"
+    if config.github_user:
+        return f"{issue} user:{config.github_user}"
+    return issue
+
+
 def search_prs(runner: Runner, config: Config, issue: str) -> list[dict[str, Any]]:
-    payload = _json_command(
-        runner,
-        [
-            config.gh_bin,
-            "search",
-            "prs",
-            issue,
-            "--state",
-            "open",
-            "--json",
-            "number,title,url,repository,state",
-        ],
-        allow=(0, 1),
-    )
-    items = payload if isinstance(payload, list) else []
     found: list[dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            owner, repo = _repo_from_item(item)
-        except ToolError:
-            continue
-        found.append(
-            {
-                "owner": owner,
-                "repo": repo,
-                "number": int(item["number"]),
-                "title": str(item.get("title") or ""),
-                "url": str(item.get("url") or ""),
-                "state": str(item.get("state") or "open"),
-            }
+    if not config.github_repo:
+        query = github_pr_search_query(config, issue)
+        payload = _json_command(
+            runner,
+            [
+                config.gh_bin,
+                "search",
+                "prs",
+                query,
+                "--state",
+                "open",
+                "--json",
+                "number,title,url,repository,state",
+            ],
+            allow=(0, 1),
         )
+        items = payload if isinstance(payload, list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                owner, repo = _repo_from_item(item)
+            except ToolError:
+                continue
+            found.append(
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "number": int(item["number"]),
+                    "title": str(item.get("title") or ""),
+                    "url": str(item.get("url") or ""),
+                    "state": str(item.get("state") or "open"),
+                }
+            )
     if config.github_repo:
         listed = _json_command(
             runner,

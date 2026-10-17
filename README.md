@@ -16,7 +16,7 @@ This repository did not contain an existing reviewer skill, bug writer, virtuali
 | Bug writer command | Optional. Receives a saved defect draft |
 | Virtualization commands | Optional replacements for the built-in profile, image pull, and launch |
 
-Set the optional commands in `.review-ticket.json` when the real skill or script is available. Until then, `run-review` writes the context bundle and waits for `import-review`.
+Set the optional commands in `.review-ticket.yaml` when the real skill or script is available. Until then, `run-review` writes the context bundle and waits for `import-review`.
 
 ## Install
 
@@ -31,28 +31,37 @@ Without an install, run `python bin/review-ticket` (or `python -m review_ticket`
 
 ## Configuration
 
-`.review-ticket.json` in the working directory is optional.
+`.review-ticket.yaml` (or `.review-ticket.yml`) in the working directory is optional. Legacy `.review-ticket.json` is still read if no YAML file exists.
 
-```json
-{
-  "github_repo": "acme/widgets",
-  "peer_review_status": "Peer Review",
-  "in_progress_status": "In Progress",
-  "approved_status": "Done",
-  "required_checks": ["build"],
-  "analyzer_checks": ["Bugbot", "CodeQL"],
-  "require_analyzers": true,
-  "standards": ["docs/standards.md"],
-  "image": "ghcr.io/acme/widgets:feature",
-  "ports": ["8080:8080"],
-  "reviewer_command": "reviewer {context} {output}",
-  "bug_writer_command": "bug-writer {draft}",
-  "checkout_command": "",
-  "virt_prepare_command": "",
-  "virt_fetch_command": "",
-  "virt_launch_command": ""
-}
+```yaml
+# Single repo, or use github_org / github_user instead (see below).
+github_repo: acme/widgets
+# github_org: acme
+
+status:
+  in_progress: In Progress
+  ready_for_peer_review: Ready for Peer Review
+  in_peer_review: Peer Review
+  approved: Ready for QA
+
+required_checks:
+  - build
+analyzer_checks:
+  - Bugbot
+  - CodeQL
+require_analyzers: true
+
+standards:
+  - docs/standards.md
+image: ghcr.io/acme/widgets:feature
+ports:
+  - "8080:8080"
+
+reviewer_command: "reviewer {context} {output}"
+bug_writer_command: "bug-writer {draft}"
 ```
+
+Pull request discovery (in order): PR URLs in the Jira issue text; then `github_repo` (`owner/repo`) for a single repository; else `github_org` for `gh search prs` with an `org:` qualifier across that organization’s repos; else `github_user` for a personal account (`user:` qualifier); else global `gh search prs` on the issue key. Set only one of `github_org` and `github_user`. You can also run `review-ticket ISSUE pr select owner/repo#number`.
 
 `require_analyzers` defaults to true. A repository that does not run Bugbot or CodeQL should set `require_analyzers` to false or clear `analyzer_checks`. Missing analyzer checks stop for a reviewer decision. They do not by themselves send the issue back to the developer.
 
@@ -100,8 +109,8 @@ Pass `--revise` to replace a stored human decision. A rerun without it keeps the
 
 ## Steps
 
-1. **Jira.** `acli jira workitem view` and `acli jira workitem comment list`. The issue must be in Peer Review. Testing notes are taken from a testing-notes field, a Testing Notes section, or a comment. Empty notes recommend In Progress. Adequacy of notes that exist is the reviewer's decision.
-2. **Pull request and checks.** Open pull requests are discovered from issue text and `gh search prs`. The head SHA, base SHA, draft state, and required checks are stored for that SHA. Pending required checks stop as `WAITING`. Failed required checks recommend In Progress. A check service that cannot be read is `BLOCKED`.
+1. **Jira.** `acli jira workitem view` and `acli jira workitem comment list`. The issue must be in **ready for peer review** or **in peer review** (see `status` in `.review-ticket.yaml`). Each status value is a string or, for the two review queue columns, a list of equivalent names. Returns use `status.in_progress`; approval uses `status.approved` (often a QA handoff column, not Done). Legacy top-level `peer_review_status`, `in_progress_status`, and `approved_status` keys still work. Testing notes are taken from a testing-notes field, a Testing Notes section, or a comment. Empty notes recommend In Progress. Adequacy of notes that exist is the reviewer's decision.
+2. **Pull request and checks.** Open pull requests are discovered from issue text, then `github_repo`, `github_org`, or `github_user` as configured, else global search. The head SHA, base SHA, draft state, and required checks are stored for that SHA. Pending required checks stop as `WAITING`. Failed required checks recommend In Progress. A check service that cannot be read is `BLOCKED`.
 3. **Bugbot and CodeQL.** Unresolved bot threads and open CodeQL alerts need a developer fix, explanation, false-positive note, or other disposition. An unaddressed finding recommends In Progress. A resolved thread is not treated as proof the code is correct. The reviewer acknowledges dispositions before continuing, or overrides them with a note.
 4. **Checkout and reviewer.** The SHA is fetched into `commits/<sha>/checkout` with `git worktree add --detach`. The reviewer context includes the Jira text, testing notes, full pull request diff, standards, analyzer dispositions, and findings from earlier SHAs. Re-review is not limited to the delta since the previous SHA.
 5. **Human review and publication.** Accept, reject, reclassify, edit, or add findings. Publish with `--yes`. Inline comments are sent only for lines present in the diff. Everything else stays in the review summary. A suggestion fence is added only when the replacement text is valid for GitHub. The live head SHA must still match the snapshot. The same payload is not posted twice. Requesting changes recommends In Progress and still requires a separate transition command.

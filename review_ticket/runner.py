@@ -41,14 +41,16 @@ class SubprocessRunner:
             input=input,
             env=env,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             check=False,
         )
         return CommandResult(
             argv=list(argv),
             returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout=completed.stdout or "",
+            stderr=completed.stderr or "",
         )
 
 

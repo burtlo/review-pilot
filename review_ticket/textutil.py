@@ -98,6 +98,28 @@ def testing_notes_from_fields(fields: dict[str, Any], description: str) -> str:
         section = extract_section(description, heading)
         if section:
             return section
+    skip_keys = {
+        "comment",
+        "description",
+        "names",
+        "schema",
+        "attachment",
+        "issuelinks",
+        "subtasks",
+        "worklog",
+    }
+    for key, value in fields.items():
+        if key in skip_keys or key.startswith("aggregate"):
+            continue
+        if not isinstance(value, (str, dict)):
+            continue
+        text = adf_to_text(value).strip()
+        if not text:
+            continue
+        for heading in ("Testing Notes", "Test Notes", "Testing"):
+            section = extract_section(text, heading)
+            if section:
+                return section
     return ""
 
 
