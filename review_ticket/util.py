@@ -27,6 +27,48 @@ def require_issue_key(issue: str) -> str:
     return key
 
 
+def parse_json_documents(text: str) -> list[Any]:
+    """Decode one or more concatenated JSON values (e.g. acli --paginate)."""
+
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("Command returned empty JSON output.")
+    decoder = json.JSONDecoder()
+    documents: list[Any] = []
+    index = 0
+    while index < len(stripped):
+        while index < len(stripped) and stripped[index].isspace():
+            index += 1
+        if index >= len(stripped):
+            break
+        document, end = decoder.raw_decode(stripped, index)
+        documents.append(document)
+        index = end
+    if not documents:
+        raise ValueError("Command returned empty JSON output.")
+    return documents
+
+
+def merge_json_documents(documents: list[Any]) -> Any:
+    if len(documents) == 1:
+        return documents[0]
+    if all(isinstance(item, dict) and "comments" in item for item in documents):
+        merged = dict(documents[-1])
+        comments: list[Any] = []
+        for page in documents:
+            page_comments = page.get("comments")
+            if isinstance(page_comments, list):
+                comments.extend(page_comments)
+        merged["comments"] = comments
+        return merged
+    if all(isinstance(item, list) for item in documents):
+        merged: list[Any] = []
+        for item in documents:
+            merged.extend(item)
+        return merged
+    return documents
+
+
 def parse_json_output(stdout: str) -> Any:
     text = stdout.strip()
     if not text:
@@ -37,7 +79,7 @@ def parse_json_output(stdout: str) -> Any:
         starts = [index for index in (text.find("{"), text.find("[")) if index >= 0]
         if not starts:
             raise
-        return json.loads(text[min(starts) :])
+        return merge_json_documents(parse_json_documents(text[min(starts) :]))
 
 
 def sha256_text(text: str) -> str:

@@ -23,11 +23,11 @@ Set the optional commands in `.review-ticket.json` when the real skill or script
 Python 3.11 or newer. For a live review you also need `acli` signed in to Jira, `gh` 2.99 or newer (the `--attach` flag), `git`, and Docker when you reach local testing.
 
 ```bash
-python3 -m pip install -e .
+python -m pip install -e .
 review-ticket DOTNETIOT-1234
 ```
 
-`bin/review-ticket` runs the same entry point without an install.
+Without an install, run `python bin/review-ticket` (or `python -m review_ticket`) from the repository root.
 
 ## Configuration
 
@@ -175,6 +175,6 @@ Session state is a small manifest (`issue`, `active_pr`, `active_sha`, `current_
 The critical branches use scripted `acli`, `gh`, `git`, and `docker` responses. One test uses a real local git worktree.
 
 ```bash
-python3 -m pip install -e '.[dev]'
-python3 -m pytest
+python -m pip install -e '.[dev]'
+python -m pytest
 ```
