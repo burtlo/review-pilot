@@ -938,7 +938,7 @@ def step_jira(app: App, session: dict[str, Any]) -> StepResult | None:
         normalized = refresh_issue(app, session)
     except ToolError as exc:
         return _blocked("jira-issue", str(exc))
-    if not app.config.status_matches(normalized.get("status") or "", app.config.peer_review_status):
+    if not app.config.accepts_peer_review_status(normalized.get("status") or ""):
         status = normalized.get("status") or "unknown"
         if _transition_recorded(app, issue, status, session.get("active_sha") or ""):
             return StepResult(
@@ -953,7 +953,7 @@ def step_jira(app: App, session: dict[str, Any]) -> StepResult | None:
             outcome=Outcome.ACTION_REQUIRED,
             summary=(
                 f"{issue} is {status}. This workflow starts when the issue is in "
-                f"{app.config.peer_review_status}."
+                f"{app.config.peer_review_status_label()}."
             ),
             next_command=f"review-ticket {issue} status",
         )

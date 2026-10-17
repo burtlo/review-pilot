@@ -50,7 +50,7 @@ def passing_checks() -> list[dict]:
     ]
 
 
-def jira_document(notes: str | None, status: str = "Peer Review") -> dict:
+def jira_document(notes: str | None, status: str = "Ready for Peer Review") -> dict:
     description = "## Acceptance Criteria\n\n- Negative quantities are rejected\n"
     if notes is not None:
         description += f"\n## Testing Notes\n\n{notes}\n"

@@ -2,13 +2,38 @@
 
 from __future__ import annotations
 
-import fcntl
+import contextlib
 import json
 import os
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from review_ticket.util import iso_now, pr_slug, require_issue_key
+
+
+@contextlib.contextmanager
+def _exclusive_file_lock(handle) -> Iterator[None]:
+    if sys.platform == "win32":
+        import msvcrt
+
+        fileno = handle.fileno()
+        handle.seek(0)
+        msvcrt.locking(fileno, msvcrt.LK_LOCK, 1)
+        handle.seek(0, os.SEEK_END)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(fileno, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def write_text(path: Path, text: str) -> None:
@@ -32,10 +57,10 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(payload, sort_keys=True) + "\n"
     with path.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        handle.write(line)
-        handle.flush()
-        os.fsync(handle.fileno())
+        with _exclusive_file_lock(handle):
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
