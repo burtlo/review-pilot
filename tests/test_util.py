@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from review_ticket import textutil
-from review_ticket.adapters import github_pr_search_query, search_prs
+from review_ticket.adapters import github_pr_search_query, jira_browse_url, search_prs
 from review_ticket.config import config_from_mapping, load_config
 from review_ticket.models import ToolError
 from review_ticket.runner import ScriptedRunner
@@ -155,3 +155,31 @@ def test_status_config_legacy_top_level_keys():
     assert legacy.accepts_peer_review_status("Ready for Peer Review")
     assert legacy.in_progress_status == "Dev"
     assert legacy.approved_status == "QA"
+
+
+def test_jira_browse_url_from_api_self_link():
+    url = jira_browse_url(
+        "DOTNETIOT-2550",
+        document={
+            "key": "DOTNETIOT-2550",
+            "self": "https://jira-prod-us-71-2.prod.atl-paas.net/rest/api/3/issue/963386",
+        },
+    )
+    assert url == "https://jira-prod-us-71-2.prod.atl-paas.net/browse/DOTNETIOT-2550"
+
+
+def test_jira_browse_url_prefers_config_site():
+    url = jira_browse_url(
+        "DOTNETIOT-2550",
+        document={
+            "key": "DOTNETIOT-2550",
+            "self": "https://jira-prod-us-71-2.prod.atl-paas.net/rest/api/3/issue/963386",
+        },
+        jira_site="https://kwiktrip.atlassian.net",
+    )
+    assert url == "https://kwiktrip.atlassian.net/browse/DOTNETIOT-2550"
+
+
+def test_jira_browse_url_uses_config_when_no_document():
+    url = jira_browse_url("DOTNETIOT-2550", jira_site="https://kwiktrip.atlassian.net")
+    assert url == "https://kwiktrip.atlassian.net/browse/DOTNETIOT-2550"

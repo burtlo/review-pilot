@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from review_ticket.config import Config
 from review_ticket.models import ToolError
@@ -82,6 +83,35 @@ def _json_command(runner: Runner, argv: list[str], *, allow: tuple[int, ...] = (
         raise ToolError(f"Could not parse JSON from {' '.join(argv)}: {exc}") from exc
 
 
+def jira_browse_url(
+    issue_key: str,
+    *,
+    stored_url: str = "",
+    document: dict[str, Any] | None = None,
+    jira_site: str | None = None,
+) -> str:
+    """Human-facing Jira issue URL (browse), not the REST API self link."""
+    key = str(issue_key or "").strip()
+    url = str(stored_url or "").strip()
+    if url:
+        return url
+    if isinstance(document, dict):
+        url = str(document.get("url") or "").strip()
+        if url:
+            return url
+    site = str(jira_site or "").strip().rstrip("/")
+    if site and key:
+        return f"{site}/browse/{key}"
+    if isinstance(document, dict):
+        self_link = str(document.get("self") or "").strip()
+        doc_key = str(document.get("key") or key).strip()
+        if self_link and doc_key:
+            parsed = urlparse(self_link)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}/browse/{doc_key}"
+    return ""
+
+
 def fetch_jira(runner: Runner, config: Config, issue: str) -> tuple[dict[str, Any], dict[str, Any]]:
     view = _json_command(
         runner,
@@ -102,10 +132,10 @@ def fetch_jira(runner: Runner, config: Config, issue: str) -> tuple[dict[str, An
         ],
     )
     raw = {"view": view, "comments": comments_payload}
-    return raw, normalize_issue(issue, view, comments_payload)
+    return raw, normalize_issue(issue, view, comments_payload, config)
 
 
-def normalize_issue(issue: str, view: Any, comments_payload: Any) -> dict[str, Any]:
+def normalize_issue(issue: str, view: Any, comments_payload: Any, config: Config) -> dict[str, Any]:
     document = _unwrap_issue(view)
     fields = document.get("fields") if isinstance(document.get("fields"), dict) else document
     if not isinstance(fields, dict):
@@ -134,15 +164,21 @@ def normalize_issue(issue: str, view: Any, comments_payload: Any) -> dict[str, A
         acceptance = extract_section(description, heading)
         if acceptance:
             break
+    key = str(document.get("key") or issue)
     return {
-        "key": str(document.get("key") or issue),
+        "key": key,
         "summary": str(fields.get("summary") or ""),
         "status": status_name,
         "description": description,
         "acceptance_criteria": acceptance,
         "testing_notes": testing.strip(),
         "comments": comments,
-        "url": str(document.get("url") or fields.get("url") or ""),
+        "url": jira_browse_url(
+            key,
+            stored_url=str(document.get("url") or fields.get("url") or ""),
+            document=document,
+            jira_site=config.jira_site,
+        ),
     }
 
 

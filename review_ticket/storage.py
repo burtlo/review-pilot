@@ -97,11 +97,22 @@ class Store:
         if existing:
             existing.setdefault("decisions", {})
             existing.setdefault("pr_candidates", [])
+            existing.setdefault("active_prs", [])
+            existing.setdefault("pr_shas", {})
+            if existing.get("pr_scope") is None:
+                existing["pr_scope"] = "all"
+            existing.setdefault("cached_step_ids", [])
+            if existing.get("active_pr") and not existing.get("active_prs"):
+                existing["active_prs"] = [existing["active_pr"]]
             return existing
         session = {
             "issue": require_issue_key(issue),
             "active_pr": None,
             "active_sha": None,
+            "active_prs": [],
+            "pr_shas": {},
+            "pr_scope": "all",
+            "cached_step_ids": [],
             "current_step": "jira-issue",
             "outcome": None,
             "last_completed_step": None,

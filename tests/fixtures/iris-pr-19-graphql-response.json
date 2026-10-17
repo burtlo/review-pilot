@@ -1,0 +1,39 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xM1QxNToyMToyMVrOq-5XDA=="
+          },
+          "nodes": [
+            {
+              "id": "PRRT_kwDOO_Edsc6r7lcM",
+              "isResolved": false,
+              "isOutdated": false,
+              "path": "KT.Shared.EmailProcessor.Iris/IrisEnvironmentKeys.cs",
+              "line": 14,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 4260545638,
+                    "url": "https://github.com/kwik-trip-iot/KT.Shared.EmailProcessor.Iris/pull/19#discussion_r4260545638",
+                    "body": "### Docker settings file never loaded\n\n**Medium Severity**\n\n<!-- DESCRIPTION START -->\n`BuildConfiguration` only calls `AddEnvironmentVariables`, so `appsettings.Docker.json` is never read even though it is copied into the image and documented as loaded when `ASPNETCORE_ENVIRONMENT=Docker`. MailPit host, port `1025`, and `UseSSL=false` therefore never apply unless compose duplicates every value; otherwise startup validation fails or SMTP uses port `587` with SSL.\n<!-- DESCRIPTION END -->\n\n<!-- BUGBOT_BUG_ID: df92a3f8-a67f-48bd-bc41-eb0a2ac31c30 -->\n\n<!-- LOCATIONS START\nKT.Shared.EmailProcessor.Iris/IrisEnvironmentKeys.cs#L10-L14\nKT.Shared.EmailProcessor.Iris/appsettings.Docker.json#L1-L25\nKT.Shared.EmailProcessor.Iris/AGENTS.md#L170-L171\nLOCATIONS END -->\n<details>\n<summary>Additional Locations (2)</summary>\n\n- [`KT.Shared.EmailProcessor.Iris/appsettings.Docker.json#L1-L25`](https://github.com/kwik-trip-iot/KT.Shared.EmailProcessor.Iris/blob/cb54abe52e1c0c40f3fd43ccf68785322385121a/KT.Shared.EmailProcessor.Iris/appsettings.Docker.json#L1-L25)\n- [`KT.Shared.EmailProcessor.Iris/AGENTS.md#L170-L171`](https://github.com/kwik-trip-iot/KT.Shared.EmailProcessor.Iris/blob/cb54abe52e1c0c40f3fd43ccf68785322385121a/KT.Shared.EmailProcessor.Iris/AGENTS.md#L170-L171)\n\n</details>\n\n<div><a href=\"https://cursor.com/open?link=eyJ2ZXJzaW9uIjoxLCJ0eXBlIjoiQlVHQk9UX0ZJWF9JTl9DVVJTT1IiLCJkYXRhIjp7InJlZGlzS2V5IjoiYnVnYm90Ojc0ZmUxNWU1LTgyZjItNGNhYy1iYzYzLWI0MmQ0ZmU2ZmVhZiIsImVuY3J5cHRpb25LZXkiOiJPMUwtb21tbkM4WGNVUnJyTlNjN2UxZllzdjBmeFl5TG15cXdqdm91ZWM4IiwiYnJhbmNoIjoiQnJpYW4vRE9UTkVUSU9ULTIzNTQiLCJyZXBvT3duZXIiOiJrd2lrLXRyaXAtaW90IiwicmVwb05hbWUiOiJLVC5TaGFyZWQuRW1haWxQcm9jZXNzb3IuSXJpcyIsInByb3ZpZGVyIjoiZ2l0aHViIn19\" target=\"_blank\" rel=\"noopener noreferrer\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://cursor.com/assets/images/fix-in-cursor-dark.png\"><source media=\"(prefers-color-scheme: light)\" srcset=\"https://cursor.com/assets/images/fix-in-cursor-light.png\"><img alt=\"Fix in Cursor\" width=\"115\" height=\"28\" src=\"https://cursor.com/assets/images/fix-in-cursor-dark.png\"></picture></a>&nbsp;<a href=\"https://cursor.com/agents?link=eyJ2ZXJzaW9uIjoxLCJ0eXBlIjoiQlVHQk9UX0ZJWF9JTl9XRUIiLCJkYXRhIjp7InJlZGlzS2V5IjoiYnVnYm90Ojc0ZmUxNWU1LTgyZjItNGNhYy1iYzYzLWI0MmQ0ZmU2ZmVhZiIsImVuY3J5cHRpb25LZXkiOiJPMUwtb21tbkM4WGNVUnJyTlNjN2UxZllzdjBmeFl5TG15cXdqdm91ZWM4IiwiYnJhbmNoIjoiQnJpYW4vRE9UTkVUSU9ULTIzNTQiLCJyZXBvT3duZXIiOiJrd2lrLXRyaXAtaW90IiwicmVwb05hbWUiOiJLVC5TaGFyZWQuRW1haWxQcm9jZXNzb3IuSXJpcyIsInByTnVtYmVyIjoxOSwiY29tbWl0U2hhIjoiY2I1NGFiZTUyZTFjMGM0MGYzZmQ0M2NjZjY4Nzg1MzIyMzg1MTIxYSIsInByb3ZpZGVyIjoiZ2l0aHViIn19\" target=\"_blank\" rel=\"noopener noreferrer\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://cursor.com/assets/images/fix-in-web-dark.png\"><source media=\"(prefers-color-scheme: light)\" srcset=\"https://cursor.com/assets/images/fix-in-web-light.png\"><img alt=\"Fix in Web\" width=\"99\" height=\"28\" src=\"https://cursor.com/assets/images/fix-in-web-dark.png\"></picture></a></div>\n\n\n<sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit cb54abe52e1c0c40f3fd43ccf68785322385121a. Configure [here](https://www.cursor.com/dashboard/bugbot).</sup>\n",
+                    "createdAt": "2026-10-13T15:21:21Z",
+                    "author": {
+                      "login": "cursor"
+                    },
+                    "commit": {
+                      "oid": "cb54abe52e1c0c40f3fd43ccf68785322385121a"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

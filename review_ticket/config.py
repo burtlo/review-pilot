@@ -48,8 +48,9 @@ class Config:
     required_checks: list[str] = field(default_factory=list)
     analyzer_checks: list[str] = field(default_factory=lambda: ["Bugbot", "CodeQL"])
     require_analyzers: bool = True
+    cache_steps: bool = False
     bugbot_authors: list[str] = field(
-        default_factory=lambda: ["cursor[bot]", "bugbot", "cursor-bugbot[bot]"]
+        default_factory=lambda: ["cursor[bot]", "cursor", "bugbot", "cursor-bugbot[bot]"]
     )
     codeql_authors: list[str] = field(
         default_factory=lambda: ["github-advanced-security[bot]", "github-code-scanning[bot]"]
@@ -66,6 +67,7 @@ class Config:
     github_repo: str | None = None
     github_org: str | None = None
     github_user: str | None = None
+    jira_site: str | None = None
     acli_bin: str = "acli"
     gh_bin: str = "gh"
     docker_bin: str = "docker"
@@ -84,6 +86,11 @@ class Config:
 
     def accepts_peer_review_status(self, actual: str) -> bool:
         return self.status.accepts_review_workflow(actual)
+
+    def is_ready_for_peer_review_status(self, actual: str) -> bool:
+        return any(
+            self.status.status_matches(actual, name) for name in self.status.ready_for_peer_review
+        )
 
     def peer_review_status_label(self) -> str:
         return self.status.review_workflow_label()
@@ -141,6 +148,8 @@ def config_from_mapping(data: dict, *, cwd: Path) -> Config:
         config.analyzer_checks = _as_list(data["analyzer_checks"])
     if "require_analyzers" in data:
         config.require_analyzers = bool(data["require_analyzers"])
+    if "cache_steps" in data:
+        config.cache_steps = bool(data["cache_steps"])
     if "bugbot_authors" in data:
         config.bugbot_authors = _as_list(data["bugbot_authors"])
     if "codeql_authors" in data:
@@ -160,6 +169,7 @@ def config_from_mapping(data: dict, *, cwd: Path) -> Config:
         "github_repo",
         "github_org",
         "github_user",
+        "jira_site",
         "acli_bin",
         "gh_bin",
         "docker_bin",

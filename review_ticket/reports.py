@@ -37,6 +37,137 @@ Status: **{issue.get('status') or 'unknown'}**
 """
 
 
+def testing_notes_decision_preview(issue: dict[str, Any], *, report_path: str) -> str:
+    testing = issue.get("testing_notes") or "_No testing notes were found._"
+    acceptance = issue.get("acceptance_criteria") or "_No acceptance criteria section was found._"
+    return f"""# Review testing notes — {issue.get('key')}
+
+{issue.get('summary') or 'Untitled'} ({issue.get('status') or 'unknown'})
+{issue.get('url') or ''}
+
+## Acceptance criteria
+
+{acceptance}
+
+## Testing notes
+
+{testing}
+
+Full issue context: {report_path}
+"""
+
+
+def format_checks_table(checks: list[dict[str, Any]]) -> str:
+    rows = ["| Check | Required | Status | State | Link |", "| --- | --- | --- | --- | --- |"]
+    for check in checks:
+        bucket = check.get("bucket") or ""
+        status = _check_status_label(bucket)
+        rows.append(
+            "| {name} | {required} | {status} | {state} | {link} |".format(
+                name=check.get("name") or "",
+                required="yes" if check.get("required") else "no",
+                status=status,
+                state=check.get("state") or "",
+                link=check.get("link") or "",
+            )
+        )
+    return "\n".join(rows) if checks else "_No checks were reported._"
+
+
+def _check_status_label(bucket: str) -> str:
+    if bucket == "pass":
+        return "pass"
+    if bucket == "pending":
+        return "pending"
+    if bucket in {"fail", "cancel"}:
+        return "fail"
+    if bucket == "missing":
+        return "missing"
+    return bucket or "unknown"
+
+
+def summarize_checks(checks: list[dict[str, Any]]) -> str:
+    required = [item for item in checks if item.get("required")]
+    if not required:
+        optional = len(checks)
+        return f"no required checks ({optional} other check(s) listed)" if optional else "no checks reported"
+    pending = [item["name"] for item in required if item.get("bucket") == "pending"]
+    failed = [item["name"] for item in required if item.get("bucket") in {"fail", "cancel"}]
+    missing = [item["name"] for item in required if item.get("bucket") == "missing"]
+    if pending:
+        return "required waiting: " + ", ".join(pending)
+    if failed:
+        return "required failed: " + ", ".join(failed)
+    if missing:
+        return "required not reported: " + ", ".join(missing)
+    return f"all {len(required)} required check(s) passed"
+
+
+def summarize_findings(findings: list[dict[str, Any]]) -> str:
+    if not findings:
+        return "no Bugbot or CodeQL threads"
+    counts: dict[str, int] = {}
+    for item in findings:
+        attention = str(item.get("attention") or "unknown")
+        counts[attention] = counts.get(attention, 0) + 1
+    parts = [f"{count} {label}" for label, count in sorted(counts.items())]
+    return ", ".join(parts)
+
+
+def multi_pr_analyzer_report(sections: list[dict[str, Any]]) -> str:
+    lines = ["# Analyzer review", "", "## Overview", ""]
+    lines.append(
+        "| Pull request | Link | CI (required) | Analyzer step | Findings |"
+    )
+    lines.append("| --- | --- | --- | --- | --- |")
+    for section in sections:
+        ref = section["pr_ref"]
+        url = section.get("pr_url") or ""
+        link_cell = f"[{ref}]({url})" if url else ref
+        lines.append(
+            "| {ref} | {link} | {checks} | {outcome} | {findings} |".format(
+                ref=ref,
+                link=link_cell,
+                checks=section.get("checks_summary") or "",
+                outcome=section.get("outcome") or "",
+                findings=section.get("findings_summary") or "",
+            )
+        )
+    lines.append("")
+    for section in sections:
+        ref = section["pr_ref"]
+        url = section.get("pr_url") or ""
+        lines.append(f"## {ref}")
+        lines.append("")
+        if url:
+            lines.append(url)
+            lines.append("")
+        readiness = section.get("readiness_summary") or ""
+        if readiness:
+            lines.append(f"**Readiness:** {readiness}")
+            lines.append("")
+        lines.append("### CI checks")
+        lines.append("")
+        lines.append(section.get("checks_table") or "_No checks were stored._")
+        lines.append("")
+        lines.append("### Analyzer findings")
+        lines.append("")
+        lines.append((section.get("detail_markdown") or "").strip())
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def multi_pr_readiness_report(sections: list[tuple[str, str, str]]) -> str:
+    """sections: (pr_ref, outcome, markdown body without top-level title)."""
+    lines = ["# Pull request readiness", ""]
+    for ref, outcome, body in sections:
+        lines.append(f"## {ref} — {outcome}")
+        lines.append("")
+        lines.append(body.strip())
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def readiness_report(
     *,
     pr: dict[str, Any],

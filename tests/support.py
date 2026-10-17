@@ -56,6 +56,7 @@ def jira_document(notes: str | None, status: str = "Ready for Peer Review") -> d
         description += f"\n## Testing Notes\n\n{notes}\n"
     return {
         "key": ISSUE,
+        "url": f"https://example.test/browse/{ISSUE}",
         "fields": {
             "summary": "Reject negative quantities",
             "status": {"name": status},
@@ -104,6 +105,12 @@ def review_threads(nodes: list[dict] | None = None) -> dict:
             }
         }
     }
+
+
+def iris_pr19_review_threads() -> dict:
+    path = Path(__file__).resolve().parent / "fixtures" / "iris-pr-19-review-thread-nodes.json"
+    nodes = json.loads(path.read_text(encoding="utf-8"))
+    return review_threads(nodes)
 
 
 def bugbot_thread(*, reply: str | None = None, resolved: bool = False) -> dict:

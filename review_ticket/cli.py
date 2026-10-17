@@ -31,6 +31,7 @@ from review_ticket.workflow import (
     record_tests,
     resume,
     run_review,
+    select_all_prs,
     select_pr,
     show_status,
     write_test_plan_command,
@@ -57,6 +58,7 @@ def main(
         config=config or load_config(),
         runner=runner or SubprocessRunner(),
         interactive=sys.stdin.isatty() if interactive is None else interactive,
+        refresh=bool(getattr(args, "refresh", False)),
         stdout=stdout,
         stderr=stderr,
     )
@@ -200,6 +202,8 @@ def _findings_document(app: App, issue: str) -> dict:
 
 
 def _pr(app: App, issue: str, args: argparse.Namespace) -> StepResult:
+    if args.pr_cmd == "select-all":
+        return select_all_prs(app, issue)
     if args.pr_cmd == "select":
         return select_pr(app, issue, args.pr_ref)
     return post_comment(
@@ -269,12 +273,30 @@ def _split_flag(value: str, flag: str) -> tuple[str, str]:
     return finding_id, rest
 
 
+def _add_refresh_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Bypass cache_steps and re-fetch Jira/GitHub data for this command.",
+    )
+
+
+def _add_refresh_to_subparsers(parser: argparse.ArgumentParser) -> None:
+    for action in parser._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        for sub_parser in action.choices.values():
+            _add_refresh_flag(sub_parser)
+            _add_refresh_to_subparsers(sub_parser)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="review-ticket",
         description="Manual peer review from a Jira issue through GitHub feedback and local testing.",
     )
     parser.add_argument("issue", help="Jira issue id, for example DOTNETIOT-1234")
+    _add_refresh_flag(parser)
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("status", help="Show the stored session without contacting Jira or GitHub")
@@ -325,7 +347,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     pr = sub.add_parser("pr", help="Select a pull request or post a general comment")
     pr_sub = pr.add_subparsers(dest="pr_cmd", required=True)
-    select = pr_sub.add_parser("select")
+    pr_sub.add_parser("select-all", help="Track every open pull request discovered for this issue")
+    select = pr_sub.add_parser("select", help="Track a single pull request")
     select.add_argument("pr_ref")
     comment = pr_sub.add_parser("comment")
     _add_comment_flags(comment)
@@ -370,6 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     disposition.add_argument("--notes", default="")
     disposition.add_argument("--override", action="store_true")
     disposition.add_argument("--revise", action="store_true")
+    _add_refresh_to_subparsers(parser)
     return parser
 
 

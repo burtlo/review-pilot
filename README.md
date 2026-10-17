@@ -37,6 +37,7 @@ Without an install, run `python bin/review-ticket` (or `python -m review_ticket`
 # Single repo, or use github_org / github_user instead (see below).
 github_repo: acme/widgets
 # github_org: acme
+# jira_site: https://your-org.atlassian.net  # optional; browse links when acli has no url
 
 status:
   in_progress: In Progress
@@ -44,8 +45,9 @@ status:
   in_peer_review: Peer Review
   approved: Ready for QA
 
-required_checks:
-  - build
+# optional: extra required check names beyond what GitHub marks on the PR
+# required_checks:
+#   - build
 analyzer_checks:
   - Bugbot
   - CodeQL
@@ -63,9 +65,13 @@ bug_writer_command: "bug-writer {draft}"
 
 Pull request discovery (in order): PR URLs in the Jira issue text; then `github_repo` (`owner/repo`) for a single repository; else `github_org` for `gh search prs` with an `org:` qualifier across that organization’s repos; else `github_user` for a personal account (`user:` qualifier); else global `gh search prs` on the issue key. Set only one of `github_org` and `github_user`. You can also run `review-ticket ISSUE pr select owner/repo#number`.
 
-`require_analyzers` defaults to true. A repository that does not run Bugbot or CodeQL should set `require_analyzers` to false or clear `analyzer_checks`. Missing analyzer checks stop for a reviewer decision. They do not by themselves send the issue back to the developer.
+When several open pull requests reference the issue, every discovered PR is tracked automatically on each run. Readiness and analyzer gates run for each; the workflow stops on the worst outcome. To review only one repository, run `review-ticket ISSUE pr select owner/repo#number` (that sets single-PR scope until you run `pr select-all` again). Per-PR artifacts stay under `reviews/ISSUE/prs/...`; combined summaries are written to `reviews/ISSUE/readiness.md` and `analyzers.md` when more than one PR is tracked. Code review and publication still run against the primary PR (`active_pr`, the first tracked ref) unless you switch with `pr select`.
+
+Readiness uses `gh pr checks --required` on each tracked pull request. Every check returned for the PR is listed in the report; only GitHub-required checks block the workflow (pending, failed, or absent from the run). Optional `required_checks` in the file adds names on top of GitHub’s list. `require_analyzers` defaults to true. An entry in `analyzer_checks` is enforced only when a **required** check on that PR matches that name (for example CodeQL). Bugbot triage still happens in the analyzer step from review threads, not from check names. Set `require_analyzers` to false when a repo does not use those tools.
 
 `REVIEWER_COMMAND`, `BUG_WRITER_COMMAND`, and `REVIEW_TICKET_REVIEWS_DIR` override the file.
+
+Set `cache_steps: true` to skip re-fetching Jira, pull request sync, checks, and analyzer threads when the tracked pull request SHAs are unchanged since the last successful pass. Pass `--refresh` on any command to force a full refresh (for example `review-ticket ISSUE --refresh` or `review-ticket ISSUE analyzers --accept-dispositions --refresh`).
 
 ## Command
 
@@ -110,8 +116,8 @@ Pass `--revise` to replace a stored human decision. A rerun without it keeps the
 ## Steps
 
 1. **Jira.** `acli jira workitem view` and `acli jira workitem comment list`. The issue must be in **ready for peer review** or **in peer review** (see `status` in `.review-ticket.yaml`). Each status value is a string or, for the two review queue columns, a list of equivalent names. Returns use `status.in_progress`; approval uses `status.approved` (often a QA handoff column, not Done). Legacy top-level `peer_review_status`, `in_progress_status`, and `approved_status` keys still work. Testing notes are taken from a testing-notes field, a Testing Notes section, or a comment. Empty notes recommend In Progress. Adequacy of notes that exist is the reviewer's decision.
-2. **Pull request and checks.** Open pull requests are discovered from issue text, then `github_repo`, `github_org`, or `github_user` as configured, else global search. The head SHA, base SHA, draft state, and required checks are stored for that SHA. Pending required checks stop as `WAITING`. Failed required checks recommend In Progress. A check service that cannot be read is `BLOCKED`.
-3. **Bugbot and CodeQL.** Unresolved bot threads and open CodeQL alerts need a developer fix, explanation, false-positive note, or other disposition. An unaddressed finding recommends In Progress. A resolved thread is not treated as proof the code is correct. The reviewer acknowledges dispositions before continuing, or overrides them with a note.
+2. **Pull request and checks.** Open pull requests are discovered from issue text, then `github_repo`, `github_org`, or `github_user` as configured, else global search. The head SHA, base SHA, draft state, and `gh pr checks` output are stored for that SHA. GitHub’s required checks on the PR gate readiness; other checks are shown for context. Pending required checks stop as `WAITING`. Failed required checks recommend In Progress. A check service that cannot be read is `BLOCKED`.
+3. **Bugbot and CodeQL.** Unresolved bot threads and open CodeQL alerts need a developer fix, explanation, false-positive note, or other disposition. An unaddressed finding recommends In Progress. When the Jira issue is still in **ready for peer review**, the next command is a Jira transition back to In Progress (after authorization). A resolved thread is not treated as proof the code is correct. The reviewer acknowledges dispositions before continuing, or overrides them with a note.
 4. **Checkout and reviewer.** The SHA is fetched into `commits/<sha>/checkout` with `git worktree add --detach`. The reviewer context includes the Jira text, testing notes, full pull request diff, standards, analyzer dispositions, and findings from earlier SHAs. Re-review is not limited to the delta since the previous SHA.
 5. **Human review and publication.** Accept, reject, reclassify, edit, or add findings. Publish with `--yes`. Inline comments are sent only for lines present in the diff. Everything else stays in the review summary. A suggestion fence is added only when the replacement text is valid for GitHub. The live head SHA must still match the snapshot. The same payload is not posted twice. Requesting changes recommends In Progress and still requires a separate transition command.
 6. **Virtualization.** `test prepare` writes `testing/profile/profile.json` and `docker-compose.yml`. Preparing again reuses that profile when the issue, pull request, branch, image, and ports match, and it does not stop other Docker projects. `test fetch` records the image digest. `test launch` refuses to start until this SHA has a fetched digest, so an old profile cannot silently test an old image.

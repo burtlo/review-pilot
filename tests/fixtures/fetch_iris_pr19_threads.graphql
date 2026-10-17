@@ -1,0 +1,26 @@
+query {
+  repository(owner: "kwik-trip-iot", name: "KT.Shared.EmailProcessor.Iris") {
+    pullRequest(number: 19) {
+      reviewThreads(first: 100) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          comments(first: 50) {
+            nodes {
+              databaseId
+              url
+              body
+              createdAt
+              author { login }
+              commit { oid }
+            }
+          }
+        }
+      }
+    }
+  }
+}
