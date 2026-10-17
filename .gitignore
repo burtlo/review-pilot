@@ -1,0 +1,10 @@
+reviews/
+.review-ticket.local.json
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+.cache/
