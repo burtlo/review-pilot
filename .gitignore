@@ -1,4 +1,5 @@
 reviews/
+agent-tools/
 .review-ticket.local.json
 __pycache__/
 .pytest_cache/
