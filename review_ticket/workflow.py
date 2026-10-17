@@ -1032,7 +1032,7 @@ def step_pull_request(app: App, session: dict[str, Any]) -> StepResult | None:
             return StepResult(
                 step="github-readiness",
                 outcome=Outcome.ACTION_REQUIRED,
-                summary=f"No open pull request references {issue}.",
+                summary=_no_pr_summary(app, issue),
                 recommendation=app.config.in_progress_status,
                 next_command=f"review-ticket {issue} pr select owner/repo#number",
             )
@@ -1408,6 +1408,16 @@ def step_disposition(app: App, session: dict[str, Any]) -> StepResult | None:
         next_command=f"review-ticket {issue} disposition --choice approve",
         report_path=str(path),
     )
+
+
+def _no_pr_summary(app: App, issue: str) -> str:
+    repo = app.config.github_repo
+    if repo:
+        return (
+            f"No open pull request references {issue} in {repo}. "
+            "Check github_repo in .review-ticket.yaml or run pr select."
+        )
+    return f"No open pull request references {issue}."
 
 
 def discover_prs(app: App, issue: str, normalized: dict[str, Any]) -> list[dict[str, Any]]:

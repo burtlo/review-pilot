@@ -73,6 +73,29 @@ def test_github_pr_search_query_rejects_org_and_user_together():
         github_pr_search_query(both, "HIV-1")
 
 
+def test_search_prs_falls_back_to_title_and_branch_match(tmp_path):
+    runner = ScriptedRunner()
+    runner.when(
+        lambda argv: "pr" in argv and "list" in argv and "--search" in argv,
+        lambda argv, cwd, data, env: __import__("review_ticket.runner", fromlist=["CommandResult"]).CommandResult(
+            argv=list(argv), returncode=0, stdout="[]", stderr=""
+        ),
+    )
+    runner.when(
+        lambda argv: "pr" in argv and "list" in argv and "--search" not in argv,
+        lambda argv, cwd, data, env: __import__("review_ticket.runner", fromlist=["CommandResult"]).CommandResult(
+            argv=list(argv),
+            returncode=0,
+            stdout='[{"number": 1, "title": "HIV-1 fix", "headRefName": "lfrank/HIV-1", "state": "OPEN"}]',
+            stderr="",
+        ),
+    )
+    config = config_from_mapping({"github_repo": "acme/app"}, cwd=tmp_path)
+    found = search_prs(runner, config, "HIV-1")
+    assert len(found) == 1
+    assert found[0]["number"] == 1
+
+
 def test_search_prs_passes_org_qualifier_to_gh(tmp_path):
     runner = ScriptedRunner()
     runner.respond("search", "prs", stdout="[]")
