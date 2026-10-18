@@ -12,6 +12,7 @@ dependencies = ["PyYAML>=6.0.1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+reviewer = ["cursor-sdk>=1.0.24"]
 
 [project.scripts]
 review-ticket = "review_ticket.cli:main"

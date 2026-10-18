@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 from dataclasses import asdict, dataclass
@@ -31,6 +32,9 @@ from review_ticket.adapters import (
 from review_ticket.authorize import authorize
 from review_ticket.checkout import ensure_checkout, git_diff
 from review_ticket.config import Config
+from review_ticket.tls_env import zscaler_tls_env
+
+_LOG = logging.getLogger("review_ticket.workflow")
 from review_ticket.findings import (
     apply_human_decisions,
     build_review_payload,
@@ -64,6 +68,7 @@ from review_ticket.reports import (
     testing_notes_decision_preview,
     return_comment,
     reviewer_prompt,
+    review_preview,
     reviewer_report,
     test_plan,
     test_results_markdown,
@@ -162,7 +167,10 @@ def _should_skip_cached_step(app: App, session: dict[str, Any], step_id: str) ->
         return False
     if _cache_fingerprint(session) != session.get("cache_fingerprint"):
         return False
-    return step_id in (session.get("cached_step_ids") or [])
+    if step_id in (session.get("cached_step_ids") or []):
+        _LOG.debug("using cached step: %s", step_id)
+        return True
+    return False
 
 
 def _mark_step_cached(session: dict[str, Any], *step_ids: str) -> None:
@@ -378,10 +386,21 @@ def select_all_prs(app: App, issue: str) -> StepResult:
 def run_review(app: App, issue: str, *, revise: bool) -> StepResult:
     issue = require_issue_key(issue)
     session = app.store.ensure_session(issue)
-    for step in (step_jira, step_pull_request, step_checks, step_analyzers):
+    _LOG.info("run-review: starting for %s", issue)
+    readiness_steps = (
+        ("Jira sync", step_jira),
+        ("pull request sync", step_pull_request),
+        ("required checks", step_checks),
+        ("analyzer findings", step_analyzers),
+    )
+    for label, step in readiness_steps:
+        _LOG.info("run-review: %s", label)
         result = step(app, session)
         if result is not None:
+            _LOG.info("run-review: stopped at %s (%s)", result.step, result.outcome.value)
             return finish(app, session, result)
+        _LOG.debug("run-review: %s complete", label)
+    _LOG.info("run-review: automated reviewer (may take several minutes)")
     return finish(app, session, _execute_reviewer(app, session, revise=revise, imported=None))
 
 
@@ -426,6 +445,22 @@ def apply_review(app: App, issue: str, human: dict[str, Any], *, revise: bool) -
             diff_index=_diff_index(app, issue, identity, sha),
         )
         write_json(review_dir / "proposed-review.json", payload)
+        _write_review_preview_markdown(
+            review_dir,
+            sha=sha,
+            document=document,
+            diff_index=_diff_index(app, issue, identity, sha),
+            human=human,
+            payload=payload,
+        )
+    else:
+        _write_review_preview_markdown(
+            review_dir,
+            sha=sha,
+            document=document,
+            diff_index=_diff_index(app, issue, identity, sha),
+            human=human,
+        )
     put_decision(session, "human_review", {"choice": "recorded", "at": iso_now()}, sha=sha, revise=revise)
     app.store.save_session(session)
     return resume(app, issue)
@@ -1624,7 +1659,7 @@ def step_publication(app: App, session: dict[str, Any]) -> StepResult | None:
             step="human-review",
             outcome=Outcome.REVIEW_DECISION,
             summary="Accept, reject, or edit the automated findings before publication.",
-            next_command=f"review-ticket {issue} review apply --accept-all",
+            next_command=f"review-ticket {issue} review interactive",
             report_path=str(review_dir / "reviewer-report.md"),
         )
     if human.get("rejected_review"):
@@ -1966,6 +2001,29 @@ def put_decision(
     bucket[sha] = value
 
 
+def _write_review_preview_markdown(
+    review_dir: Path,
+    *,
+    sha: str,
+    document: dict[str, Any],
+    diff_index: set[tuple[str, int, str]],
+    human: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    findings = document.get("findings") or []
+    write_text(
+        review_dir / "review-preview.md",
+        review_preview(
+            sha=sha,
+            document=document,
+            findings=findings,
+            diff_index=diff_index,
+            human=human,
+            payload=payload,
+        ),
+    )
+
+
 def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, imported: Any | None) -> StepResult:
     issue = session["issue"]
     identity = _require_identity(session)
@@ -1975,13 +2033,17 @@ def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, import
         raise WorkflowError("A review already exists for this SHA. Pass --revise to archive it and run again.")
     if revise:
         _archive_review(review_dir)
+    repository = f"{identity[0]}/{identity[1]}"
+    _LOG.debug("preparing review context for %s @ %s", repository, sha)
     diff_text = _ensure_diff(app, session)
     index = parse_unified_diff(diff_text)
     write_json(review_dir / "diff-lines.json", sorted([list(item) for item in index]))
     output = review_dir / "reviewer-output.json"
     context = _write_context(app, session, diff_text, output)
+    reviewer_command, reviewer_route, reviewer_profile = app.config.resolve_reviewer(repository)
     if imported is None:
-        if not app.config.reviewer_command:
+        if not reviewer_command:
+            _LOG.info("reviewer_command unset; preparing import-review handoff")
             return StepResult(
                 step="automated-review",
                 outcome=Outcome.REVIEW_DECISION,
@@ -1992,15 +2054,34 @@ def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, import
                 next_command=f"review-ticket {issue} import-review --file PATH",
                 report_path=str(context / "prompt.md"),
             )
+        agent_id = "reviewer"
+        if reviewer_profile and reviewer_profile.agent:
+            agent_id = reviewer_profile.agent
         mapping = {
             "context": str(context),
             "output": str(output),
             "issue": issue,
             "sha": sha,
             "checkout": str(_commit_dir(app, issue, identity, sha) / "checkout"),
-            "repository": f"{identity[0]}/{identity[1]}",
+            "repository": repository,
+            "agent": agent_id,
         }
-        result = run_external(app.runner, app.config.reviewer_command, mapping)
+        _LOG.info("invoking reviewer (%s)", reviewer_route)
+        _LOG.debug(
+            "reviewer context=%s checkout=%s output=%s agent=%s",
+            mapping["context"],
+            mapping["checkout"],
+            mapping["output"],
+            agent_id,
+        )
+        reviewer_env = {"REVIEW_TICKET_LOG_LEVEL": app.config.log_level}
+        reviewer_env.update(zscaler_tls_env())
+        result = run_external(
+            app.runner,
+            reviewer_command,
+            mapping,
+            env=reviewer_env,
+        )
         if output.exists():
             imported = json.loads(output.read_text(encoding="utf-8"))
         elif result.stdout.strip():
@@ -2013,10 +2094,13 @@ def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, import
             return _blocked("automated-review", detail)
     if imported is None:
         return _blocked("automated-review", f"The reviewer did not write {output}.")
+    raw_count = len((imported.get("findings") or []) if isinstance(imported, dict) else [])
+    _LOG.info("normalizing reviewer output (%d raw finding(s))", raw_count)
     try:
         document, findings = normalize_findings(imported)
     except WorkflowError as exc:
         return _blocked("automated-review", str(exc))
+    _LOG.debug("normalized to %d finding(s)", len(findings))
     previous = _previous_finding_rows(app, issue, identity, sha)
     reconciliation = reconcile([row for batch in previous for row in batch["findings"]], findings)
     stored = {
@@ -2035,14 +2119,21 @@ def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, import
         diff_index=index,
     )
     write_json(review_dir / "proposed-review.json", proposed)
+    _write_review_preview_markdown(
+        review_dir,
+        sha=sha,
+        document=stored,
+        diff_index=index,
+        payload=proposed,
+    )
     session["last_completed_step"] = "automated-review"
     return StepResult(
         step="human-review",
         outcome=Outcome.REVIEW_DECISION,
         summary="Automated review is stored locally. Decide each finding before publication.",
-        next_command=f"review-ticket {issue} review apply --accept-all",
+        next_command=f"review-ticket {issue} review interactive",
         report_path=str(review_dir / "reviewer-report.md"),
-        details={"completed_step": "automated-review"},
+        details={"completed_step": "automated-review", "reviewer_route": reviewer_route},
     )
 
 
@@ -2053,9 +2144,11 @@ def _ensure_diff(app: App, session: dict[str, Any]) -> str:
     commit_dir = _commit_dir(app, issue, identity, sha)
     existing = commit_dir / "diff.patch"
     if existing.exists() and (commit_dir / "review" / "diff-lines.json").exists():
+        _LOG.debug("reusing existing diff.patch for %s", sha)
         return existing.read_text(encoding="utf-8")
     pr = _load_pr(app, issue, identity)
     checkout = commit_dir / "checkout"
+    _LOG.info("checkout: preparing worktree at %s", checkout)
     ensure_checkout(
         app.runner,
         app.config,
@@ -2561,6 +2654,7 @@ def _archive_review(review_dir: Path) -> None:
     names = [
         "findings.json",
         "reviewer-report.md",
+        "review-preview.md",
         "proposed-review.json",
         "human-review.json",
         "reconciliation.json",
@@ -2643,6 +2737,63 @@ def _jira_url(app: App, issue: str) -> str:
     return jira_browse_url(key, jira_site=app.config.jira_site)
 
 
+def _review_context_prompt_path(app: App, session: dict[str, Any]) -> str | None:
+    identity = _selected(session)
+    sha = session.get("active_sha")
+    issue = session.get("issue")
+    if identity is None or not sha or not issue:
+        return None
+    return str(_review_dir(app, issue, identity, sha) / "context" / "prompt.md")
+
+
+def _reviewer_command_status(app: App, session: dict[str, Any]) -> str:
+    identity = _selected(session)
+    if identity is None:
+        repository = ""
+    else:
+        repository = f"{identity[0]}/{identity[1]}"
+    command, _, _ = app.config.resolve_reviewer(repository)
+    return "configured" if command else "unset"
+
+
+def _shows_review_handoff(result: StepResult) -> bool:
+    if result.step == "automated-review" and result.outcome in {Outcome.READY, Outcome.REVIEW_DECISION}:
+        return True
+    if result.step != "human-review" or result.outcome != Outcome.REVIEW_DECISION:
+        return False
+    next_cmd = result.next_command or ""
+    if "review interactive" in next_cmd or "import-review" in next_cmd:
+        return True
+    return result.details.get("completed_step") == "automated-review"
+
+
+def _review_chain_hint(issue: str, result: StepResult) -> str:
+    prefix = f"review-ticket {issue}"
+    if (
+        result.step == "automated-review"
+        and result.outcome == Outcome.REVIEW_DECISION
+        and result.next_command
+        and "import-review" in result.next_command
+    ):
+        return (
+            f"chain: {prefix} run-review → {prefix} import-review → "
+            f"{prefix} review interactive → {prefix} publish-review --yes"
+        )
+    return (
+        f"chain: {prefix} run-review → {prefix} review interactive → "
+        f"{prefix} publish-review --yes"
+    )
+
+
+def _multi_pr_review_hint(active_prs: list[str]) -> str | None:
+    if len(active_prs) <= 1:
+        return None
+    return (
+        "Multiple pull requests are tracked. Complete the review chain for the active PR, "
+        "then use pr select to switch targets and repeat."
+    )
+
+
 def _pr_url_for_ref(app: App, issue: str, ref: str) -> str:
     try:
         owner, repo, number = parse_pr_ref(ref)
@@ -2680,6 +2831,16 @@ def _render(app: App, session: dict[str, Any], result: StepResult) -> None:
         if pr_url:
             pr_line += f"  {pr_url}"
         lines.append(pr_line)
+    if _shows_review_handoff(result):
+        context_path = _review_context_prompt_path(app, session)
+        if context_path:
+            lines.append(f"context: {context_path}")
+        lines.append(f"reviewer_command: {_reviewer_command_status(app, session)}")
+        if issue_key:
+            lines.append(_review_chain_hint(issue_key, result))
+        multi_hint = _multi_pr_review_hint(active_prs)
+        if multi_hint:
+            lines.append(f"hint: {multi_hint}")
     lines.extend([f"step: {result.step}", f"outcome: {result.outcome.value}", "", result.summary])
     if result.recommendation:
         lines.append(f"recommendation: {result.recommendation}")
@@ -2692,6 +2853,9 @@ def _render(app: App, session: dict[str, Any], result: StepResult) -> None:
         lines.append("")
         lines.append("Pull requests:")
         lines.extend(analyzer_rows)
+    reviewer_route = result.details.get("reviewer_route")
+    if reviewer_route:
+        lines.append(f"reviewer: {reviewer_route}")
     if result.report_path:
         lines.append(f"report: {result.report_path}")
     app.write("\n".join(lines).rstrip() + "\n")

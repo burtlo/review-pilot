@@ -1,0 +1,3 @@
+# Placeholder so the certs/ directory is tracked.
+# Copy your org ZScaler root CA to zscaler-root.cer (gitignored).
+# review-ticket uses it automatically when ZSCALER_CERT_PATH is unset.

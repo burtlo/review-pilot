@@ -1,3 +1,8 @@
+# Org ZScaler root — copy from IT; do not commit if policy forbids
+certs/zscaler-root.cer
+certs/zscaler-root.pem
+certs/zscaler-root.crt
+
 reviews/
 agent-tools/
 .review-ticket.local.json
@@ -9,3 +14,4 @@ __pycache__/
 dist/
 build/
 .cache/
+.review-ticket.yaml

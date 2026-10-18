@@ -265,8 +265,102 @@ def test_dispositioned_bugbot_finding_can_proceed_after_review(tmp_path):
     assert "run-review" in output
 
 
+def test_run_review_uses_ui_admin_reviewer_for_mapped_repository(tmp_path):
+    from review_ticket.config import ReviewerProfile
+
+    app, runner, world = make_app(
+        tmp_path,
+        reviewer_command="reviewer {context} {output} {agent}",
+        reviewer_by_repository={
+            "acme/widgets": ReviewerProfile(agent="ui-admin-reviewer"),
+        },
+    )
+    _ready_issue(world)
+    world.reviewer_output = {
+        "summary": "UI admin review.",
+        "approval_recommendation": "approve",
+        "findings": [],
+    }
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "run-review"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "reviewer: agent=ui-admin-reviewer (acme/widgets)" in output
+    reviewer_calls = [call for call in runner.calls if call and call[0] == "reviewer"]
+    assert len(reviewer_calls) == 1
+    assert "ui-admin-reviewer" in " ".join(reviewer_calls[0])
+
+
+def test_run_review_handoff_when_reviewer_command_unset(tmp_path):
+    app, runner, world = make_app(tmp_path, reviewer_command=None)
+    _ready_issue(world)
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "run-review"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "outcome: REVIEW_DECISION" in output
+    assert "import-review" in output
+    assert "context:" in output
+    assert "prompt.md" in output
+    assert "reviewer_command: unset" in output
+    assert not any(call and call[0] == "reviewer" for call in runner.calls)
+
+
+def test_automated_review_ready_handoff_lists_context_and_chain(tmp_path):
+    app, _runner, world = make_app(tmp_path, reviewer_command="reviewer {context} {output}")
+    _ready_issue(world)
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "analyzers", "--accept-dispositions"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "step: automated-review" in output
+    assert "outcome: READY" in output
+    assert "context:" in output and "prompt.md" in output
+    assert "reviewer_command: configured" in output
+    assert "chain:" in output
+    assert "run-review" in output
+    assert "review interactive" in output
+    assert "publish-review" in output
+
+
+def test_run_review_next_command_is_review_interactive(tmp_path):
+    app, _runner, world = make_app(tmp_path, reviewer_command="reviewer {context} {output}")
+    _ready_issue(world)
+    world.reviewer_output = {
+        "summary": "Looks good.",
+        "approval_recommendation": "approve",
+        "findings": [],
+    }
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "run-review"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert f"next: review-ticket {ISSUE} review interactive" in output
+    assert "reviewer_command: configured" in output
+
+
+def test_review_handoff_multi_pr_hint(tmp_path):
+    app, _runner, world = make_app(tmp_path, reviewer_command="reviewer {context} {output}")
+    doc = jira_document("Ran the cart tests and recorded the result.")
+    doc["fields"]["description"] += (
+        "\nhttps://github.com/acme/widgets/pull/87\n"
+        "https://github.com/acme/other/pull/88\n"
+    )
+    world.issue = doc
+    world.required_checks = passing_checks()
+    world.all_checks = passing_checks()
+    world.threads = review_threads()
+    world.head_sha = SHA1
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "analyzers", "--accept-dispositions"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "hint:" in output
+    assert "pr select" in output
+
+
 def test_reviewer_places_must_fix_inline_and_keeps_general_findings(tmp_path):
-    app, runner, world = make_app(tmp_path)
+    app, runner, world = make_app(tmp_path, reviewer_command="reviewer {context} {output}")
     _ready_issue(world)
     world.reviewer_output = {
         "summary": "Quantity is not validated on every path.",
@@ -329,13 +423,18 @@ def test_publish_rejects_stale_sha_and_does_not_post(tmp_path):
 
 
 def test_repeat_publication_does_not_create_a_second_review(tmp_path):
+    from review_ticket.util import fingerprint
+
     app, runner, world = make_app(tmp_path)
     _seed_publishable(tmp_path, sha=SHA1)
     world.head_sha = SHA1
     assert _run(app, [ISSUE, "publish-review", "--yes"]) == 0
     assert len(posts(runner)) == 1
-    receipt = read_json(_commit(tmp_path, SHA1) / "review" / "publication.json")
+    review_dir = _commit(tmp_path, SHA1) / "review"
+    receipt = read_json(review_dir / "publication.json")
+    payload = read_json(review_dir / "publish-payload.json")
     assert receipt["github_review_id"] == 4242
+    assert receipt["fingerprint"] == fingerprint(payload)
     assert _run(app, [ISSUE, "publish-review", "--yes"]) == 0
     assert len(posts(runner)) == 1
     assert "already published" in app.stdout.getvalue()

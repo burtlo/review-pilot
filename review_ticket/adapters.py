@@ -700,9 +700,21 @@ def _command_with_image(template: str, image: str) -> list[str]:
     return argv
 
 
-def run_external(runner: Runner, command: str, mapping: dict[str, str]) -> CommandResult:
+def run_external(
+    runner: Runner,
+    command: str,
+    mapping: dict[str, str],
+    *,
+    env: dict[str, str] | None = None,
+) -> CommandResult:
+    import os
+
     argv = shlex_command(command, mapping)
     unused = not any("{" + key + "}" in command for key in mapping)
     if unused:
         argv.extend(mapping[key] for key in ("context", "output") if key in mapping)
-    return runner.run(argv)
+    merged_env = None
+    if env is not None:
+        merged_env = os.environ.copy()
+        merged_env.update(env)
+    return runner.run(argv, env=merged_env)

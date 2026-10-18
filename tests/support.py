@@ -223,8 +223,22 @@ class World:
                 raise AssertionError("virtualization must not destroy environments with compose down")
             return self._ok(argv, "")
         if argv[0] == "reviewer":
-            Path(argv[-1]).write_text(json.dumps(self.reviewer_output), encoding="utf-8")
+            output_path = next(
+                (part for part in argv if part.endswith("reviewer-output.json")),
+                argv[-1],
+            )
+            Path(output_path).write_text(json.dumps(self.reviewer_output), encoding="utf-8")
             return self._ok(argv, "")
+        if "review-ticket-reviewer-stub.py" in joined:
+            import subprocess
+
+            completed = subprocess.run(argv, capture_output=True, text=True, check=False)
+            return CommandResult(
+                list(argv),
+                completed.returncode,
+                completed.stdout or "",
+                completed.stderr or "",
+            )
         raise AssertionError(f"unexpected command: {joined}")
 
     def _check_code(self, checks: list[dict]) -> int:
@@ -247,10 +261,12 @@ def make_app(tmp_path: Path, world: World | None = None, **config_kwargs) -> tup
     world = world or World()
     runner = ScriptedRunner()
     runner.when(lambda argv: True, world.handle)
+    reviewer_by_repository = config_kwargs.pop("reviewer_by_repository", None)
     config = Config(
         reviews_dir=tmp_path / "reviews",
         cache_dir=tmp_path / "cache",
-        reviewer_command=config_kwargs.pop("reviewer_command", "reviewer {context} {output}"),
+        reviewer_command=config_kwargs.pop("reviewer_command", None),
+        reviewer_by_repository=reviewer_by_repository or {},
         **config_kwargs,
     )
     stdout = io.StringIO()

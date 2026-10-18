@@ -8,10 +8,12 @@ import sys
 from pathlib import Path
 
 from review_ticket.config import Config, load_config
+from review_ticket.logutil import configure_logging
 from review_ticket.models import AuthorizationDenied, Outcome, StepResult, WorkflowError
 from review_ticket.runner import Runner, SubprocessRunner
 from review_ticket.storage import read_json
 from review_ticket.util import require_issue_key
+from review_ticket.interactive_triage import run_interactive_triage
 from review_ticket.workflow import (
     App,
     apply_review,
@@ -54,8 +56,10 @@ def main(
     except ValueError as exc:
         print(str(exc), file=stderr or sys.stderr)
         return 2
+    resolved_config = config or load_config()
+    configure_logging(resolved_config.log_level, stream=stderr or sys.stderr)
     app = App(
-        config=config or load_config(),
+        config=resolved_config,
         runner=runner or SubprocessRunner(),
         interactive=sys.stdin.isatty() if interactive is None else interactive,
         refresh=bool(getattr(args, "refresh", False)),
@@ -132,6 +136,9 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
 def _review(app: App, issue: str, args: argparse.Namespace) -> StepResult:
     if args.review_cmd == "show":
         return show_status(app, issue)
+    if args.review_cmd == "interactive":
+        human = run_interactive_triage(app, issue, revise=args.revise)
+        return apply_review(app, issue, human, revise=args.revise)
     if args.file and (args.accept_all or args.finding or args.reject_automated):
         raise WorkflowError("Use either --file or the individual review flags, not both.")
     if args.file:
@@ -331,6 +338,11 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument("--summary")
     apply_parser.add_argument("--reject-automated", action="store_true")
     apply_parser.add_argument("--revise", action="store_true")
+    interactive_parser = review_sub.add_parser(
+        "interactive",
+        help="Interactively accept or reject findings and save the human review",
+    )
+    interactive_parser.add_argument("--revise", action="store_true")
 
     publish = sub.add_parser("publish-review", help="Publish the approved local review to GitHub")
     publish.add_argument("--yes", action="store_true")

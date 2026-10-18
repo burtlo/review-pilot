@@ -233,6 +233,137 @@ def analyzer_report(findings: list[dict[str, Any]], *, unavailable: str = "") ->
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _finding_on_diff(finding: dict[str, Any], diff_index: set[tuple[str, int, str]]) -> bool:
+    path = finding.get("path")
+    line = finding.get("line")
+    side = finding.get("side") or "RIGHT"
+    return bool(path) and isinstance(line, int) and (path, line, side) in diff_index
+
+
+def publish_preview_counts_for_findings(
+    findings: list[dict[str, Any]],
+    diff_index: set[tuple[str, int, str]],
+    *,
+    human: dict[str, Any] | None = None,
+) -> tuple[int, int]:
+    """Inline vs summary-only counts for accepted findings (matches build_review_payload)."""
+    if human and human.get("rejected_review"):
+        return 0, 0
+    inline = 0
+    summary_only = 0
+    decisions = (human or {}).get("findings") if human else None
+    for finding in findings:
+        if human:
+            decision = (decisions or {}).get(finding["id"]) or {}
+            if decision.get("decision") == "reject":
+                continue
+            if decision.get("decision") != "accept":
+                continue
+        elif finding.get("decision") == "reject":
+            continue
+        if _finding_on_diff(finding, diff_index):
+            inline += 1
+        else:
+            summary_only += 1
+    return inline, summary_only
+
+
+def review_preview(
+    *,
+    sha: str,
+    document: dict[str, Any],
+    findings: list[dict[str, Any]],
+    diff_index: set[tuple[str, int, str]],
+    human: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> str:
+    lines = [f"# Review preview `{sha}`", ""]
+    summary = (human or {}).get("summary") or document.get("summary") or ""
+    if summary.strip():
+        lines.extend(["## Summary", "", summary.rstrip(), ""])
+    if human and human.get("rejected_review"):
+        lines.extend(
+            [
+                "## Publish preview",
+                "",
+                "The automated review was **rejected**. Nothing will be published.",
+                "",
+            ]
+        )
+    else:
+        inline, summary_only = publish_preview_counts_for_findings(findings, diff_index, human=human)
+        if payload:
+            inline = len(payload.get("comments") or [])
+        event = (payload or {}).get("event") or (human or {}).get("event") or ""
+        lines.extend(["## Publish preview", ""])
+        if event:
+            lines.append(f"GitHub review event: **{event}**")
+            lines.append("")
+        lines.append(f"- **{inline}** inline comment(s) on the diff")
+        lines.append(f"- **{summary_only}** finding(s) in the review summary only")
+        if not human:
+            lines.append("")
+            lines.append(
+                "_Counts assume all findings are accepted until you record a human review "
+                "(`review apply` or `review interactive`)._"
+            )
+        lines.append("")
+    lines.extend(["## Findings", ""])
+    if not findings:
+        lines.append("_No findings were recorded._")
+    else:
+        decisions = (human or {}).get("findings") if human else None
+        for finding in findings:
+            fid = finding.get("id") or ""
+            title = finding.get("title") or "Untitled"
+            if human and human.get("rejected_review"):
+                triage = "n/a"
+            elif human:
+                entry = (decisions or {}).get(fid) or {}
+                triage = entry.get("decision") or "undecided"
+            else:
+                triage = "pending"
+            must = "must-fix" if finding.get("must_fix") else "suggestion"
+            priority = finding.get("priority") or "medium"
+            where = finding.get("path") or "general"
+            if finding.get("line"):
+                where = f"{where}:{finding['line']}"
+            placement = (
+                "inline on diff"
+                if _finding_on_diff(finding, diff_index)
+                else "summary only (off diff or no line)"
+            )
+            if triage == "reject":
+                placement = "will not publish"
+            lines.append(f"### {fid} {title}")
+            lines.append("")
+            lines.append(f"- Triage: **{triage}** · {must} · {priority}")
+            lines.append(f"- Location: `{where}` · {placement}")
+            explanation = finding.get("explanation") or ""
+            if human and not human.get("rejected_review"):
+                entry = (decisions or {}).get(fid) or {}
+                if entry.get("explanation"):
+                    explanation = str(entry["explanation"])
+            if explanation.strip():
+                lines.append("")
+                lines.append(explanation.rstrip())
+            if finding.get("suggested_change"):
+                lines.extend(["", "Suggested change:", "", "```", str(finding["suggested_change"]).rstrip(), "```"])
+            lines.append("")
+    lines.extend(
+        [
+            "## File-based triage",
+            "",
+            "Without the interactive TUI, edit decisions in `human-review.json` and run "
+            "`review apply --file human-review.json`, or use `review apply` flags. "
+            "`reviewer-report.md` is the automated reviewer narrative; this file focuses on "
+            "publish placement and triage status.",
+            "",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def reviewer_report(document: dict[str, Any], findings: list[dict[str, Any]], reconciliation: list[dict[str, Any]]) -> str:
     lines = ["# Automated review", ""]
     if document.get("summary"):

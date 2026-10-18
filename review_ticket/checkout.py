@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import shlex
 from pathlib import Path
+
+_LOG = logging.getLogger("review_ticket.checkout")
 
 from review_ticket.config import Config
 from review_ticket.models import ToolError
@@ -58,9 +61,11 @@ def ensure_checkout(
         "repository": f"{owner}/{repo}",
     }
     if config.checkout_command:
+        _LOG.debug("checkout_command for %s -> %s", mapping["repository"], mapping["dest"])
         argv = _format_command(config.checkout_command, mapping)
         _run(runner, argv)
     else:
+        _LOG.debug("default gh clone + worktree for %s @ %s", mapping["repository"], sha)
         cache = config.cache_dir / "repos" / owner / repo
         if not (cache / ".git").exists():
             cache.parent.mkdir(parents=True, exist_ok=True)

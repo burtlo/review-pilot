@@ -4,7 +4,9 @@ import pytest
 
 from review_ticket import textutil
 from review_ticket.adapters import github_pr_search_query, jira_browse_url, search_prs
-from review_ticket.config import config_from_mapping, load_config
+from review_ticket.config import ReviewerProfile, config_from_mapping, load_config
+from review_ticket.logutil import parse_log_level
+from review_ticket.tls_env import default_zscaler_cert_path, zscaler_tls_env
 from review_ticket.models import ToolError
 from review_ticket.runner import ScriptedRunner
 from review_ticket.util import merge_json_documents, parse_json_documents, parse_json_output
@@ -119,6 +121,57 @@ def test_status_config_accepts_review_queue_columns():
     assert not single.accepts_peer_review_status("In Progress")
     assert single.in_progress_status == "In Progress"
     assert single.approved_status == "Done"
+
+
+def test_default_zscaler_cert_path_when_present():
+    path = default_zscaler_cert_path()
+    if path is not None:
+        assert path.name.startswith("zscaler-root")
+        assert path.parent.name == "certs"
+
+
+def test_zscaler_tls_env_from_file(tmp_path, monkeypatch):
+    cert = tmp_path / "zscaler.pem"
+    cert.write_text("-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    monkeypatch.setenv("ZSCALER_CERT_PATH", str(cert))
+    env = zscaler_tls_env()
+    assert env["NODE_EXTRA_CA_CERTS"] == str(cert.resolve())
+    assert env["SSL_CERT_FILE"] == str(cert.resolve())
+
+
+def test_log_level_config_and_env(monkeypatch):
+    config = config_from_mapping({"log_level": "debug"}, cwd=Path("."))
+    assert config.log_level == "debug"
+    monkeypatch.setenv("REVIEW_TICKET_LOG_LEVEL", "error")
+    overridden = config_from_mapping({"log_level": "debug"}, cwd=Path("."))
+    assert overridden.log_level == "error"
+    assert parse_log_level("INFO") == 20
+
+
+def test_reviewer_by_repository_yaml_and_resolve():
+    config = config_from_mapping(
+        {
+            "reviewer_command": "default-reviewer {context} {output}",
+            "reviewer_by_repository": {
+                "kwik-trip-iot/KT.IoT.UI.Admin": {"agent": "ui-admin-reviewer"},
+                "acme/widgets": {"command": "widgets-reviewer {context} {output}"},
+            },
+        },
+        cwd=Path("."),
+    )
+    assert config.reviewer_by_repository["kwik-trip-iot/KT.IoT.UI.Admin"] == ReviewerProfile(
+        agent="ui-admin-reviewer"
+    )
+    cmd, label, profile = config.resolve_reviewer("kwik-trip-iot/KT.IoT.UI.Admin")
+    assert cmd == "default-reviewer {context} {output}"
+    assert label == "agent=ui-admin-reviewer (kwik-trip-iot/KT.IoT.UI.Admin)"
+    assert profile and profile.agent == "ui-admin-reviewer"
+    cmd, label, _ = config.resolve_reviewer("acme/widgets")
+    assert cmd == "widgets-reviewer {context} {output}"
+    assert label == "per-repository command (acme/widgets)"
+    cmd, label, _ = config.resolve_reviewer("acme/other")
+    assert cmd == "default-reviewer {context} {output}"
+    assert label == "default"
 
 
 def test_load_config_from_yaml_with_comments(tmp_path):
