@@ -1,11 +1,12 @@
 # Review Ticket TUI review flow
 
-Status: **implementation map ready** — [spec](spec.md) is the source of truth (status line: design specification for implementation). Canonical map is [implementation.md](implementation.md).
+Status: **implementation map ready** — [spec](spec.md) is the source of truth (status line: design specification for implementation). Canonical map is [implementation.md](implementation.md). Operator session notes from DOTNETIOT-2550 attach are in [retro.md](retro.md) (open; not yet folded into the spec).
 
 | Artifact | Description |
 |----------|-------------|
 | [spec.md](spec.md) | Feature specification for the review TUI |
 | [implementation.md](implementation.md) | **Canonical** — deltas, work packages (P1–P14), verifier hooks, build order |
+| [retro.md](retro.md) | Product feedback from an attach session (hub generate, prepare screen, triage layout, re-attach) |
 
 ## Summary
 
