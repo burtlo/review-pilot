@@ -159,6 +159,8 @@ class World:
         self.remote_reviews: list = []
         self.transition_code = 0
         self.comment_code = 0
+        self.review_code = 0
+        self.compose_up_code = 0
         self.digest = "sha256:" + "a" * 64
         self.reviewer_output = {
             "summary": "Quantity is not validated on every path.",
@@ -198,6 +200,8 @@ class World:
                 return CommandResult(argv, self.alerts_code, "", self.alerts_stderr or "HTTP 403")
             return self._ok(argv, self.alerts)
         if "--method" in argv and "POST" in argv and "/reviews" in joined:
+            if self.review_code:
+                return CommandResult(argv, self.review_code, "", "review failed")
             return self._ok(
                 argv,
                 {
@@ -224,6 +228,8 @@ class World:
         if argv[0] == "docker" and "compose" in argv:
             if "down" in argv:
                 raise AssertionError("virtualization must not destroy environments with compose down")
+            if "up" in argv and self.compose_up_code:
+                return CommandResult(argv, self.compose_up_code, "", "compose failed")
             return self._ok(argv, "")
         if argv[0] == "reviewer":
             output_path = next(

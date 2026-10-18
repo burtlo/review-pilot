@@ -99,6 +99,7 @@ def test_human_document_matches_apply_file_shape():
         },
         "added": [],
         "event": "REQUEST_CHANGES",
+        "track_disposition": "REQUEST_CHANGES",
         "summary": "Summary text",
     }
 

@@ -7,8 +7,9 @@ from textual.containers import Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Header, ListItem, ListView, Markdown
 
-from review_ticket.storage import Store
+from review_ticket.storage import Store, read_json
 from review_ticket.status_projection import PrStatusRow, StatusProjection, project_review_status
+from review_ticket.tui.hub_screen import ReviewHubScreen, should_auto_present_hub
 from review_ticket.tui.pr_screen import PrReviewScreen
 from review_ticket.tui.status_format import format_pr_list_label, format_status_document
 
@@ -16,7 +17,10 @@ from review_ticket.tui.status_format import format_pr_list_label, format_status_
 class StatusScreen(Screen[None]):
     """Read-only session status; PR rows open the review screen without writing session."""
 
-    BINDINGS = [("q", "quit_status", "Quit")]
+    BINDINGS = [
+        ("q", "quit_status", "Quit"),
+        ("h", "open_hub", "Hub"),
+    ]
 
     CSS = """
     StatusScreen {
@@ -87,6 +91,10 @@ class StatusScreen(Screen[None]):
     def _reload(self) -> None:
         self._projection = project_review_status(self._store, self._issue)
         self._pr_rows = self._projection.pr_rows
+        if self._projection.issue_title:
+            self.sub_title = f"{self._issue} — {self._projection.issue_title}"
+        else:
+            self.sub_title = self._issue
         self.query_one("#status-doc", Markdown).update(format_status_document(self._projection))
         list_view = self.query_one("#pr-list", ListView)
         labels = [format_pr_list_label(row) for row in self._pr_rows]
@@ -112,6 +120,13 @@ class StatusScreen(Screen[None]):
 
     def action_quit_status(self) -> None:
         self.app.exit()
+
+    def action_open_hub(self) -> None:
+        session = read_json(self._store.issue_dir(self._issue) / "session.json") or {}
+        if not should_auto_present_hub(session):
+            return
+        workflow_app = getattr(self.app, "workflow_app", None)
+        self.app.push_screen(ReviewHubScreen(self._store, self._issue, workflow_app))
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.item is None or event.list_view.id != "pr-list":

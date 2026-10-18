@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from dataclasses import replace
+
 from review_ticket.reports import return_comment
 from review_ticket.storage import read_json, read_jsonl, write_json
 from review_ticket.tui import ReviewTicketApp
+from review_ticket.tui.decision_panel import DecisionPanel, DecisionPanelState
+from review_ticket.tui.readiness_screen import ReadinessScreen
 from review_ticket.tui.status_screen import StatusScreen
 from review_ticket.tui.testing_notes_screen import TestingNotesScreen
 from review_ticket.util import sha256_text
@@ -65,8 +69,9 @@ def test_jira_issue_without_notes_opens_testing_notes_screen(tmp_path):
             assessment = tui.screen.query_one("#assessment-md", Markdown).source
             assert "No testing notes were detected" in assessment
             assert "Testing notes assessment" not in assessment
-            accept = tui.screen.query_one("#accept-btn", Button)
-            assert accept.display is True
+            approve = tui.screen.query_one("#approve-btn", Button)
+            assert approve.display is True
+            assert approve.disabled is True
             assert tui.screen.query_one("#reject-btn", Button).display is True
             session = read_json(tmp_path / "reviews" / ISSUE / "session.json")
             assert "testing_notes" not in (session.get("decisions") or {})
@@ -77,7 +82,7 @@ def test_jira_issue_without_notes_opens_testing_notes_screen(tmp_path):
 
 
 def test_ticket_panels_grow_when_terminal_grows_taller(tmp_path):
-    """Spare rows go to the issue panes; the accept/reject row stays one button tall."""
+    """Spare rows go to the issue panes; the decision row stays one button tall."""
     _seed_jira_issue_session(tmp_path)
     app, _runner, world = make_app(tmp_path)
     world.issue = jira_document(notes=None)
@@ -96,12 +101,12 @@ def test_ticket_panels_grow_when_terminal_grows_taller(tmp_path):
 
             tall_description = screen.query_one("#description-scroll").region.height
             tall_assessment = screen.query_one("#assessment-scroll").region.height
-            dock = screen.query_one("#workflow-dock").region
+            panel = screen.query_one("#decision-panel")
             assert tall_description >= short_description + 10
             assert tall_assessment >= short_assessment + 10
+            assert tall_assessment >= tall_description
             assert screen.query_one("#decision-row").region.height == short_row == 3
-            # Dock sits on the footer, so the grown panes consumed the extra rows.
-            assert dock.bottom == screen.size.height - 1
+            assert panel.region.bottom == screen.size.height - 1
 
     asyncio.run(_run())
 
@@ -117,6 +122,23 @@ def test_human_review_session_stays_on_status_screen(tmp_path):
             await pilot.pause()
             assert isinstance(tui.screen, StatusScreen)
             assert not [call for call in runner.calls if call and call[0] == "acli"]
+
+    asyncio.run(_run())
+
+
+def test_reject_hides_description_keeps_notes_visible(tmp_path):
+    _seed_jira_issue_session(tmp_path)
+    app, _runner, world = make_app(tmp_path)
+    world.issue = jira_document(notes=None)
+    tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
+
+    async def _run() -> None:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.click("#reject-btn")
+            await pilot.pause()
+            assert tui.screen.query_one("#description-scroll").display is False
+            assert tui.screen.query_one("#assessment-scroll").display is True
 
     asyncio.run(_run())
 
@@ -153,14 +175,15 @@ def test_reject_save_writes_draft_and_decision(tmp_path):
             assert decision["notes_hash"] == sha256_text("")
             assert (root / "return-comment.md").read_text(encoding="utf-8") == edited
             assert session["return_draft"] == str(root / "return-comment.md")
-            assert tui.screen.query_one("#accept-btn", Button).disabled is True
+            assert tui.screen.query_one("#approve-btn", Button).disabled is True
             assert tui.screen.query_one("#reject-btn", Button).disabled is True
 
     asyncio.run(_run())
 
 
-def test_accept_advances_to_status_screen(tmp_path):
+def test_accept_advances_to_readiness_screen(tmp_path):
     _seed_jira_issue_session(tmp_path)
+    root = tmp_path / "reviews" / ISSUE
     app, _runner, world = make_app(tmp_path)
     world.issue = jira_document("Ran the cart tests and recorded the result.")
     world.required_checks = passing_checks()
@@ -171,14 +194,43 @@ def test_accept_advances_to_status_screen(tmp_path):
         async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             assert isinstance(tui.screen, TestingNotesScreen)
-            await pilot.click("#accept-btn")
+            await pilot.click("#approve-btn")
             await pilot.pause()
-            assert isinstance(tui.screen, StatusScreen)
-            session = read_json(tmp_path / "reviews" / ISSUE / "session.json")
+            assert isinstance(tui.screen, ReadinessScreen)
+            session = read_json(root / "session.json")
             assert session["decisions"]["testing_notes"]["choice"] == "accept"
             assert session.get("current_step") != "jira-issue"
-            status_md = tui.screen.query_one("#status-doc", Markdown).source
-            assert session.get("next_command") in status_md or session.get("current_step") in status_md
+            summary = tui.screen.query_one("#summary-md", Markdown).source
+            assert "Overall" in summary
+            assert not (root / "actions.jsonl").exists()
+
+    asyncio.run(_run())
+
+
+def test_reopen_after_saved_reject_restores_draft_preview(tmp_path):
+    _seed_jira_issue_session(tmp_path)
+    root = tmp_path / "reviews" / ISSUE
+    app, _runner, world = make_app(tmp_path)
+    world.issue = jira_document(notes=None)
+    tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
+    saved_body = "Draft kept after leaving the screen.\n"
+
+    async def _run() -> None:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.click("#reject-btn")
+            await pilot.pause()
+            tui.screen.query_one("#return-draft", TextArea).text = saved_body
+            await pilot.click("#save-btn")
+            await pilot.pause()
+            tui.pop_screen()
+            tui.push_screen(TestingNotesScreen(tui.store, ISSUE, app))
+            await pilot.pause()
+            assert tui.screen.query_one("#description-scroll").display is False
+            preview = tui.screen.query_one("#saved-preview-md", Markdown).source
+            assert saved_body.rstrip() in preview
+            panel = tui.screen.query_one("#decision-panel", DecisionPanel)
+            assert panel._model.state == DecisionPanelState.SAVED
 
     asyncio.run(_run())
 
@@ -201,6 +253,8 @@ async def _save_reject_draft(pilot, tui, body: str = "Edited return body for pos
     tui.screen.query_one("#return-draft", TextArea).text = body
     await pilot.click("#save-btn")
     await pilot.pause()
+    await pilot.click("#continue-btn")
+    await pilot.pause()
 
 
 def test_post_approve_posts_comment_and_shows_transition(tmp_path):
@@ -215,17 +269,17 @@ def test_post_approve_posts_comment_and_shows_transition(tmp_path):
         async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui, body)
-            preview = tui.screen.query_one("#post-preview-md", Markdown).source
+            preview = tui.screen.query_one("#comment-preview-md", Markdown).source
             assert body.rstrip() in preview
             assert f"Comment on {ISSUE}" in preview
-            await pilot.click("#post-approve-btn")
+            await pilot.click("#comment-yes-btn")
             await pilot.pause()
             assert len(_jira_comment_creates(runner)) == 1
             actions = read_jsonl(root / "actions.jsonl")
             assert any(entry.get("status") == "success" and entry.get("kind") == "jira.comment" for entry in actions)
             transition_md = tui.screen.query_one("#transition-preview-md", Markdown).source
             assert "In Progress" in transition_md
-            assert tui.screen.query_one("#transition-panel").display is True
+            assert tui.screen.query_one("#transition-group").display is True
 
     asyncio.run(_run())
 
@@ -242,11 +296,12 @@ def test_post_deny_leaves_session_and_actions_unchanged(tmp_path):
             await pilot.pause()
             await _save_reject_draft(pilot, tui)
             session_after_save = read_json(root / "session.json")
-            await pilot.click("#post-deny-btn")
+            await pilot.click("#comment-no-btn")
             await pilot.pause()
             assert read_json(root / "session.json") == session_after_save
             assert not (root / "actions.jsonl").exists()
             assert not _jira_comment_creates(runner)
+            assert tui.screen.query_one("#transition-group").display is True
 
     asyncio.run(_run())
 
@@ -256,15 +311,24 @@ def test_second_post_approve_is_idempotent(tmp_path):
     app, runner, world = make_app(tmp_path)
     world.issue = jira_document(notes=None)
     tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
+    body = "Edited return body for post.\n"
 
     async def _run() -> None:
         async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
-            await _save_reject_draft(pilot, tui)
-            await pilot.click("#post-approve-btn")
+            await _save_reject_draft(pilot, tui, body)
+            await pilot.click("#comment-yes-btn")
             await pilot.pause()
-            tui.screen._show_post_panel()
-            await pilot.click("#post-approve-btn")
+            panel = tui.screen.query_one("#decision-panel", DecisionPanel)
+            panel.restore_model(
+                replace(
+                    panel.model,
+                    state=DecisionPanelState.COMMENT_CONFIRM,
+                    comment_outcome=None,
+                    comment_preview=f"Comment on {ISSUE}.\n\n{body.rstrip()}\n",
+                )
+            )
+            await pilot.click("#comment-yes-btn")
             await pilot.pause()
             assert len(_jira_comment_creates(runner)) == 1
 
@@ -281,9 +345,9 @@ def test_transition_approve_returns_to_status_screen(tmp_path):
         async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui)
-            await pilot.click("#post-approve-btn")
+            await pilot.click("#comment-yes-btn")
             await pilot.pause()
-            await pilot.click("#transition-approve-btn")
+            await pilot.click("#transition-yes-btn")
             await pilot.pause()
             assert isinstance(tui.screen, StatusScreen)
             assert len(_jira_transitions(runner)) == 1
@@ -301,12 +365,12 @@ def test_transition_deny_does_not_transition(tmp_path):
         async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui)
-            await pilot.click("#post-approve-btn")
+            await pilot.click("#comment-yes-btn")
             await pilot.pause()
-            await pilot.click("#transition-deny-btn")
+            await pilot.click("#transition-no-btn")
             await pilot.pause()
             assert not _jira_transitions(runner)
-            assert tui.screen.query_one("#transition-panel").display is True
+            assert isinstance(tui.screen, StatusScreen)
 
     asyncio.run(_run())
 
@@ -322,11 +386,11 @@ def test_failed_post_shows_blocked_and_keeps_transition_hidden(tmp_path):
         async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui)
-            await pilot.click("#post-approve-btn")
+            await pilot.click("#comment-yes-btn")
             await pilot.pause()
-            preview = tui.screen.query_one("#post-preview-md", Markdown).source
-            assert "Blocked" in preview
-            assert tui.screen.query_one("#transition-panel").display is False
+            preview = tui.screen.query_one("#comment-preview-md", Markdown).source
+            assert "Failed" in preview
+            assert tui.screen.query_one("#transition-group").display is False
 
     asyncio.run(_run())
 

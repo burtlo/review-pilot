@@ -313,7 +313,7 @@ def test_automated_review_ready_handoff_lists_context_and_chain(tmp_path):
     assert "run-review" in output
     assert f"{ISSUE} attach" in output
     assert "review attach" not in output
-    assert "publish-review" in output
+    assert "test prepare" in output
 
 
 def test_run_review_next_command_is_review_attach(tmp_path):
@@ -657,6 +657,8 @@ def _seed_publishable(tmp_path: Path, sha: str) -> None:
             "findings": {"F001": {"decision": "accept", "must_fix": True}},
             "added": [],
             "event": "REQUEST_CHANGES",
+            "track_disposition": "REQUEST_CHANGES",
+            "track_disposition_confirmed": True,
             "summary": "Please validate quantity.",
         },
     )

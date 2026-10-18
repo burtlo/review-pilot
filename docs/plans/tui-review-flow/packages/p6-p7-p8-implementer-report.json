@@ -1,0 +1,70 @@
+[
+  {
+    "package": "P6",
+    "title": "Automated review preparation",
+    "status": "completed",
+    "spec_sections": ["§8", "Scenario D"],
+    "deliverables": [
+      "review_ticket/prepare_projection.py",
+      "review_ticket/tui/automated_prepare_screen.py",
+      "review_ticket/workflow.py — generate_automated_review, _ensure_diff/_write_context identity+sha",
+      "review_ticket/tui/hub_screen.py — automated track opens preparation screen"
+    ],
+    "tests": {
+      "commands": ["pytest tests/test_tui_prepare.py"],
+      "result": "5 passed"
+    },
+    "acceptance": {
+      "scenario_d_labels": "pass",
+      "no_generation_on_mount": "pass",
+      "generate_selected_one_identity": "pass",
+      "import_handoff_without_findings": "pass",
+      "failed_generation_retryable": "pass"
+    }
+  },
+  {
+    "package": "P7",
+    "title": "Automated finding triage",
+    "status": "completed",
+    "spec_sections": ["§9", "Scenario E"],
+    "deliverables": [
+      "review_ticket/tui/pr_screen.py — Include/Exclude, diff excerpt, local disposition",
+      "review_ticket/interactive_triage.py — track_disposition fields",
+      "review_ticket/textutil.py — diff_excerpt"
+    ],
+    "tests": {
+      "commands": ["pytest tests/test_tui_pr.py"],
+      "result": "11 passed"
+    },
+    "acceptance": {
+      "include_exclude_persist": "pass",
+      "excluded_omitted_from_payload": "pass",
+      "diff_context_excerpt": "pass",
+      "save_writes_human_review": "pass",
+      "second_save_refused": "pass",
+      "close_no_write": "pass"
+    }
+  },
+  {
+    "package": "P8",
+    "title": "Human code review track",
+    "status": "completed",
+    "spec_sections": ["§10"],
+    "deliverables": [
+      "review_ticket/manual_review.py",
+      "review_ticket/workflow.py — save_manual_review",
+      "review_ticket/tui/manual_review_screen.py",
+      "review_ticket/hub_projection.py — manual track opens screen"
+    ],
+    "tests": {
+      "commands": ["pytest tests/test_tui_manual_review.py tests/test_manual_findings.py"],
+      "result": "3 passed"
+    },
+    "acceptance": {
+      "manual_review_json_on_complete": "pass",
+      "no_publication_on_save": "pass",
+      "approve_eligibility_requires_manual": "pass",
+      "duplicate_manual_suppressed": "pass"
+    }
+  }
+]

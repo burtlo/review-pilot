@@ -1,0 +1,78 @@
+[
+  {
+    "package": "P9",
+    "title": "GitHub composition and publication",
+    "status": "completed",
+    "repair_pass": "2026-10-18",
+    "verifier_gaps_closed": [
+      "COMMENT gate without manual review",
+      "compose preview includes merged manual findings aligned with publish_review",
+      "failed create_review journals failure without publication.json receipt"
+    ],
+    "tests": {
+      "commands": [
+        "pytest tests/test_tui_publication.py tests/test_workflow_tracks.py -k \"comment_requires or request_changes_allowed_without or failed_create_review or publish_appends or request_changes_requires\""
+      ],
+      "result": "11 passed"
+    }
+  },
+  {
+    "package": "P10",
+    "title": "Test environment view",
+    "status": "completed",
+    "repair_pass": "2026-10-18",
+    "verifier_gaps_closed": [
+      "launch ToolError surfaces BLOCKED",
+      "projection is read-only (no runner calls on mount)"
+    ],
+    "tests": {
+      "commands": [
+        "pytest tests/test_tui_test_environment.py tests/test_test_env_projection.py"
+      ],
+      "result": "6 passed"
+    },
+    "notes": "Headless TestEnvironmentScreen button pilot skipped (Textual render_strips failure on Python 3.14); workflow and projection tests cover prepare/fetch/launch gating."
+  },
+  {
+    "package": "P11",
+    "title": "Functional testing track",
+    "status": "completed",
+    "repair_pass": "2026-10-18",
+    "verifier_gaps_closed": [
+      "fail plus REQUEST_CHANGES stores steps without publish",
+      "wrong SHA test result is not functional pass evidence"
+    ],
+    "tests": {
+      "commands": [
+        "pytest tests/test_record_tests.py tests/test_tui_functional_testing.py"
+      ],
+      "result": "7 passed"
+    }
+  },
+  {
+    "package": "P12",
+    "title": "Ticket disposition",
+    "status": "completed",
+    "repair_pass": "2026-10-18",
+    "verifier_gaps_closed": [
+      "scenario H multi-PR ticket approve predicate",
+      "REQUEST_CHANGES receipt disables ticket approve (workflow and hub)",
+      "CLI disposition leave and override regression"
+    ],
+    "tests": {
+      "commands": [
+        "pytest tests/test_ticket_disposition.py tests/test_tui_hub.py tests/test_workflow_tracks.py::test_disposition_leave_and_override_still_work"
+      ],
+      "result": "12 passed"
+    }
+  },
+  {
+    "package": "full_suite",
+    "title": "tests/",
+    "status": "pass",
+    "tests": {
+      "commands": ["pytest tests/ -q"],
+      "result": "193 passed"
+    }
+  }
+]

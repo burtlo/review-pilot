@@ -54,6 +54,8 @@ from review_ticket.policy import (
     suggest_event as policy_suggest_event,
     testing_outcome,
 )
+from review_ticket.readiness_projection import project_readiness_gate
+from review_ticket.tracks import append_publication_receipt, publication_eligibility
 from review_ticket.reports import (
     analyzer_report,
     disposition_report,
@@ -63,6 +65,7 @@ from review_ticket.reports import (
     multi_pr_analyzer_report,
     multi_pr_readiness_report,
     readiness_report,
+    readiness_return_draft,
     summarize_checks,
     summarize_findings,
     return_comment,
@@ -193,9 +196,9 @@ def resume(app: App, issue: str) -> StepResult:
         step_checks,
         step_analyzers,
         step_automated_review,
-        step_publication,
         step_virtualization,
         step_testing,
+        step_publication,
         step_disposition,
     )
     try:
@@ -276,6 +279,34 @@ def decide_notes(
     return resume(app, issue)
 
 
+def decide_readiness(
+    app: App,
+    issue: str,
+    choice: str,
+    notes: str,
+    *,
+    revise: bool,
+    draft_body: str | None = None,
+) -> StepResult:
+    issue = require_issue_key(issue)
+    if choice not in {"accept", "reject"}:
+        raise WorkflowError("Readiness decision must be accept or reject.")
+    session = app.store.ensure_session(issue)
+    value = {"choice": choice, "notes": notes, "at": iso_now()}
+    put_decision(session, "pr_readiness", value, revise=revise)
+    _append_note(app, issue, notes)
+    if choice == "reject":
+        if draft_body is not None:
+            draft_path = app.store.issue_dir(issue) / "return-comment.md"
+            write_text(draft_path, draft_body)
+            draft = draft_path
+        else:
+            draft = _write_readiness_return_draft(app, issue, notes=notes)
+        session["return_draft"] = str(draft)
+    app.store.save_session(session)
+    return resume(app, issue)
+
+
 def assess(
     app: App,
     issue: str,
@@ -326,21 +357,7 @@ def decide_analyzers(app: App, issue: str, choice: str, notes: str, *, revise: b
         put_decision(session, "analyzers", value, sha=sha, revise=revise)
     _append_note(app, issue, notes)
     if choice == "return":
-        findings: list[dict[str, Any]] = []
-        links: list[str] = []
-        for owner, repo, number, sha in scope:
-            identity = (owner, repo, number)
-            loaded = _load_analyzer_findings(app, issue, identity, sha)
-            findings.extend(loaded)
-            links.extend(item["url"] for item in loaded if item.get("url"))
-        titles = [f"{item['id']} {item.get('path') or ''} — {item.get('body', '')[:180]}" for item in findings]
-        draft = _write_return_draft(
-            app,
-            issue,
-            reason="Bugbot or CodeQL findings still need a developer disposition.\n\n" + "\n".join(titles),
-            notes=notes,
-            links=links,
-        )
+        draft = _write_readiness_return_draft(app, issue, notes=notes)
         session["return_draft"] = str(draft)
     app.store.save_session(session)
     return resume(app, issue)
@@ -395,9 +412,17 @@ def select_all_prs(app: App, issue: str) -> StepResult:
     return resume(app, issue)
 
 
-def run_review(app: App, issue: str, *, revise: bool) -> StepResult:
+def run_review(
+    app: App,
+    issue: str,
+    *,
+    revise: bool,
+    pr_ref: str | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
     session = app.store.ensure_session(issue)
+    identity, resolved_sha = _resolve_workflow_target(session, pr_ref=pr_ref, sha=sha)
     _LOG.info("run-review: starting for %s", issue)
     readiness_steps = (
         ("Jira sync", step_jira),
@@ -413,7 +438,18 @@ def run_review(app: App, issue: str, *, revise: bool) -> StepResult:
             return finish(app, session, result)
         _LOG.debug("run-review: %s complete", label)
     _LOG.info("run-review: automated reviewer (may take several minutes)")
-    return finish(app, session, _execute_reviewer(app, session, revise=revise, imported=None))
+    return finish(
+        app,
+        session,
+        _execute_reviewer(
+            app,
+            session,
+            revise=revise,
+            imported=None,
+            identity=identity,
+            sha=resolved_sha,
+        ),
+    )
 
 
 def import_review(app: App, issue: str, file: Path, *, revise: bool) -> StepResult:
@@ -478,6 +514,82 @@ def _persist_human_review_files(
         )
 
 
+def generate_automated_review(
+    app: App,
+    issue: str,
+    *,
+    identity: tuple[str, str, int],
+    sha: str,
+    revise: bool = False,
+) -> StepResult:
+    """Run automated review generation for one PR/SHA without changing active_pr."""
+    from review_ticket.prepare_projection import clear_generation_status, write_generation_status
+
+    issue = require_issue_key(issue)
+    session = app.store.ensure_session(issue)
+    active_before = session.get("active_pr")
+    sha_before = session.get("active_sha")
+    try:
+        result = _execute_reviewer(
+            app,
+            session,
+            revise=revise,
+            imported=None,
+            identity=identity,
+            sha=sha,
+        )
+        if result.outcome == Outcome.BLOCKED:
+            write_generation_status(app.store, issue, identity, sha, status="failed", error=result.summary)
+        else:
+            clear_generation_status(app.store, issue, identity, sha)
+    except WorkflowError as exc:
+        write_generation_status(app.store, issue, identity, sha, status="failed", error=str(exc))
+        result = _blocked("automated-review", str(exc))
+    finished = finish(app, session, result)
+    session = app.store.ensure_session(issue)
+    session["active_pr"] = active_before
+    session["active_sha"] = sha_before
+    app.store.save_session(session)
+    return finished
+
+
+def save_manual_review(
+    app: App,
+    issue: str,
+    document: dict[str, Any],
+    *,
+    sha: str,
+    identity: tuple[str, str, int] | None = None,
+    revise: bool = False,
+    completed: bool = False,
+) -> None:
+    """Persist manual code review for a commit snapshot without publishing."""
+    from review_ticket.manual_review import manual_document_from_form
+
+    issue = require_issue_key(issue)
+    session = _require_review_session(app, issue)
+    resolved_identity = identity or _require_identity(session)
+    review_dir = _review_dir(app, issue, resolved_identity, sha)
+    existing = read_json(review_dir / "manual-review.json")
+    if existing and not revise:
+        raise WorkflowError("A manual review is already recorded. Pass --revise to replace it.")
+    payload = manual_document_from_form(
+        notes=str(document.get("notes") or ""),
+        findings=list(document.get("findings") or []),
+        disposition=document.get("disposition"),
+        completed=completed or bool(document.get("completed")),
+    )
+    write_json(review_dir / "manual-review.json", payload)
+    put_decision(
+        session,
+        "manual_review",
+        {"choice": "recorded" if payload["completed"] else "draft", "at": iso_now()},
+        sha=sha,
+        revise=revise,
+    )
+    app.store.save_session(session)
+
+
 def save_snapshot_review(
     app: App,
     issue: str,
@@ -531,30 +643,61 @@ def apply_review(app: App, issue: str, human: dict[str, Any], *, revise: bool) -
     return resume(app, issue)
 
 
-def publish_review(app: App, issue: str, *, yes: bool, event: str | None, skip: bool) -> StepResult:
+def publish_review(
+    app: App,
+    issue: str,
+    *,
+    yes: bool,
+    event: str | None,
+    skip: bool,
+    pr_ref: str | None = None,
+    sha: str | None = None,
+    summary: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
     session = _require_review_session(app, issue)
-    identity = _require_identity(session)
+    identity, resolved_sha = _resolve_workflow_target(session, pr_ref=pr_ref, sha=sha)
     owner, repo, number = identity
-    sha = session["active_sha"]
+    sha = resolved_sha
     review_dir = _review_dir(app, issue, identity, sha)
+    commit_dir = _commit_dir(app, issue, identity, sha)
     document = read_json(review_dir / "findings.json")
     human = read_json(review_dir / "human-review.json")
     if not document or not human:
         raise WorkflowError("Publish needs automated findings and a recorded human review.")
     if human.get("rejected_review") and not skip:
         raise WorkflowError("The automated review was rejected. Nothing will be published.")
-    publication_path = review_dir / "publication.json"
-    existing = read_json(publication_path)
-    merged = [] if human.get("rejected_review") else apply_human_decisions(document.get("findings") or [], human)
+    existing = read_json(review_dir / "publication.json")
+    if human.get("rejected_review"):
+        merged: list[dict[str, Any]] = []
+    else:
+        from review_ticket.publication_compose import merged_publication_findings
+
+        merged = merged_publication_findings(commit_dir)
     chosen = event or human.get("event") or (policy_suggest_event(merged) if merged else "COMMENT")
-    summary = human.get("summary") or document.get("summary") or "Peer review."
+    diff_index = _diff_index(app, issue, identity, sha)
+    if not skip:
+        allowed, reason = publication_eligibility(chosen, commit_dir, expected_sha=sha)
+        if not allowed:
+            return finish(
+                app,
+                session,
+                StepResult(step="human-review", outcome=Outcome.BLOCKED, summary=reason),
+            )
+        inline_reason = _inline_findings_off_diff(merged, diff_index)
+        if inline_reason:
+            return finish(
+                app,
+                session,
+                StepResult(step="human-review", outcome=Outcome.BLOCKED, summary=inline_reason),
+            )
+    body_summary = summary or human.get("summary") or document.get("summary") or "Peer review."
     payload = build_review_payload(
         sha=sha,
         event=chosen,
-        summary=summary,
+        summary=body_summary,
         findings=merged,
-        diff_index=_diff_index(app, issue, identity, sha),
+        diff_index=diff_index,
     )
     digest = fingerprint(payload)
     if existing and existing.get("status") == "success" and existing.get("fingerprint") == digest:
@@ -569,7 +712,7 @@ def publish_review(app: App, issue: str, *, yes: bool, event: str | None, skip: 
             "event": chosen,
             "published_at": iso_now(),
         }
-        write_json(publication_path, receipt)
+        append_publication_receipt(review_dir, receipt)
         _journal(app, issue, _commit_dir(app, issue, identity, sha), "github.review", digest, "success", receipt, sha)
         return finish(app, session, _after_publication(app, issue, sha, receipt, skipped=False))
 
@@ -591,7 +734,7 @@ def publish_review(app: App, issue: str, *, yes: bool, event: str | None, skip: 
     remote = _matching_remote_review(app, owner, repo, number, payload)
     if remote is not None:
         receipt = _receipt_from_remote(remote, digest, sha, chosen)
-        write_json(publication_path, receipt)
+        append_publication_receipt(review_dir, receipt)
         return finish(app, session, _after_publication(app, issue, sha, receipt, skipped=True))
 
     preview = _publication_preview(owner, repo, number, payload)
@@ -632,16 +775,22 @@ def publish_review(app: App, issue: str, *, yes: bool, event: str | None, skip: 
         "comment_urls": [item.get("html_url") or item.get("url") for item in comments],
         "published_at": iso_now(),
     }
-    write_json(publication_path, receipt)
+    append_publication_receipt(review_dir, receipt)
     _journal(app, issue, _commit_dir(app, issue, identity, sha), "github.review", digest, "success", receipt, sha)
     return finish(app, session, _after_publication(app, issue, sha, receipt, skipped=False))
 
 
-def prepare_profile(app: App, issue: str) -> StepResult:
+def prepare_profile(
+    app: App,
+    issue: str,
+    *,
+    pr_ref: str | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
     session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    identity, resolved_sha = _resolve_workflow_target(session, pr_ref=pr_ref, sha=sha)
+    sha = resolved_sha
     pr = _load_pr(app, issue, identity)
     profile_dir = _commit_dir(app, issue, identity, sha) / "testing" / "profile"
     desired = _desired_profile(app, issue, pr, sha)
@@ -665,11 +814,17 @@ def prepare_profile(app: App, issue: str) -> StepResult:
     )
 
 
-def fetch_image(app: App, issue: str) -> StepResult:
+def fetch_image(
+    app: App,
+    issue: str,
+    *,
+    pr_ref: str | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
     session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    identity, resolved_sha = _resolve_workflow_target(session, pr_ref=pr_ref, sha=sha)
+    sha = resolved_sha
     profile_dir = _commit_dir(app, issue, identity, sha) / "testing" / "profile"
     profile_path = profile_dir / "profile.json"
     profile = read_json(profile_path)
@@ -712,11 +867,17 @@ def fetch_image(app: App, issue: str) -> StepResult:
     )
 
 
-def launch_environment(app: App, issue: str) -> StepResult:
+def launch_environment(
+    app: App,
+    issue: str,
+    *,
+    pr_ref: str | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
     session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    identity, resolved_sha = _resolve_workflow_target(session, pr_ref=pr_ref, sha=sha)
+    sha = resolved_sha
     testing_dir = _commit_dir(app, issue, identity, sha) / "testing"
     profile = read_json(testing_dir / "profile" / "profile.json")
     environment = read_json(testing_dir / "environment.json")
@@ -729,6 +890,8 @@ def launch_environment(app: App, issue: str) -> StepResult:
         docker_compose_up(app.runner, app.config, profile["project_name"], compose)
     except ToolError as exc:
         return finish(app, session, _blocked("virtualization", str(exc)))
+    environment["launched_at"] = iso_now()
+    write_json(testing_dir / "environment.json", environment)
     return finish(
         app,
         session,
@@ -769,6 +932,13 @@ def record_tests(
     scenarios: list[str],
     evidence: list[str],
     revise: bool,
+    pr_ref: str | None = None,
+    sha: str | None = None,
+    steps: str = "",
+    observed: str = "",
+    expected: str = "",
+    plan_reference: str = "",
+    disposition: str | None = None,
 ) -> StepResult:
     issue = require_issue_key(issue)
     if result not in {"pass", "fail", "blocked"}:
@@ -780,14 +950,21 @@ def record_tests(
     if result == "pass":
         kind = None
     session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    identity, resolved_sha = _resolve_workflow_target(session, pr_ref=pr_ref, sha=sha)
+    sha = resolved_sha
     testing_dir = _commit_dir(app, issue, identity, sha) / "testing"
     existing = read_json(testing_dir / "test-results.json")
     if existing and not revise:
         raise WorkflowError("Test results already exist for this SHA. Pass --revise to replace them.")
     environment = read_json(testing_dir / "environment.json") or {}
     stored_evidence = _store_evidence(testing_dir, evidence)
+    normalized_disposition = None
+    if disposition:
+        normalized_disposition = disposition.upper()
+        if normalized_disposition not in {"APPROVE", "COMMENT", "REQUEST_CHANGES"}:
+            raise WorkflowError("Disposition must be APPROVE, COMMENT, or REQUEST_CHANGES.")
+        if result == "blocked" and normalized_disposition == "REQUEST_CHANGES":
+            raise WorkflowError("Blocked environment results cannot select Request Changes.")
     payload = {
         "sha": sha,
         "image": environment.get("image"),
@@ -797,6 +974,11 @@ def record_tests(
         "notes": notes,
         "scenarios": scenarios,
         "evidence": stored_evidence,
+        "steps": steps.strip(),
+        "observed": observed.strip(),
+        "expected": expected.strip(),
+        "plan_reference": plan_reference.strip(),
+        "disposition": normalized_disposition,
         "recorded_at": iso_now(),
     }
     write_json(testing_dir / "test-results.json", payload)
@@ -1132,6 +1314,73 @@ def record_disposition(
             step="disposition",
             outcome=Outcome.READY,
             summary="Approval recorded. Authorize the Jira transition to advance the issue.",
+            recommendation=app.config.approved_status,
+            next_command=f"review-ticket {issue} jira transition --status {json_quote(app.config.approved_status)} --yes",
+            report_path=str(path),
+            details={"completed_step": "disposition"},
+        ),
+    )
+
+
+def record_ticket_disposition(
+    app: App,
+    issue: str,
+    *,
+    choice: str,
+    notes: str = "",
+    revise: bool = False,
+) -> StepResult:
+    """Record ticket-level disposition without refreshing external systems (TUI P12)."""
+    from review_ticket.ticket_disposition import project_ticket_disposition
+
+    issue = require_issue_key(issue)
+    if choice not in {"approve", "return"}:
+        raise WorkflowError("Ticket disposition must be approve or return.")
+    session = _require_review_session(app, issue)
+    projection = project_ticket_disposition(app.store, issue)
+    if not projection.dock_enabled:
+        raise WorkflowError(projection.dock_reason)
+    if choice == "approve" and not projection.approve_enabled:
+        raise WorkflowError(projection.approve_reason)
+    put_decision(
+        session,
+        "ticket_disposition",
+        {"choice": choice, "notes": notes, "at": iso_now()},
+        revise=revise,
+    )
+    app.store.save_session(session)
+    path = app.store.issue_dir(issue) / "ticket-disposition.json"
+    write_json(
+        path,
+        {
+            "choice": choice,
+            "notes": notes,
+            "blockers": [blocker.ref for blocker in projection.blockers],
+            "at": iso_now(),
+        },
+    )
+    if choice == "return":
+        return finish(
+            app,
+            session,
+            StepResult(
+                step="disposition",
+                outcome=Outcome.ACTION_REQUIRED,
+                summary="Ticket reject recorded. Authorize the Jira comment and transition when ready.",
+                recommendation=app.config.in_progress_status,
+                next_command=(
+                    f"review-ticket {issue} jira transition --status {json_quote(app.config.in_progress_status)} --yes"
+                ),
+                report_path=str(path),
+            ),
+        )
+    return finish(
+        app,
+        session,
+        StepResult(
+            step="disposition",
+            outcome=Outcome.READY,
+            summary="Ticket approval recorded. Authorize the Jira transition when ready.",
             recommendation=app.config.approved_status,
             next_command=f"review-ticket {issue} jira transition --status {json_quote(app.config.approved_status)} --yes",
             report_path=str(path),
@@ -1684,8 +1933,26 @@ def step_analyzers(app: App, session: dict[str, Any]) -> StepResult | None:
 def step_automated_review(app: App, session: dict[str, Any]) -> StepResult | None:
     issue = session["issue"]
     identity = _require_identity(session)
-    review_dir = _review_dir(app, issue, identity, session["active_sha"])
+    sha = session["active_sha"]
+    review_dir = _review_dir(app, issue, identity, sha)
     if read_json(review_dir / "findings.json"):
+        human = read_json(review_dir / "human-review.json")
+        if not human:
+            return StepResult(
+                step="human-review",
+                outcome=Outcome.REVIEW_DECISION,
+                summary="Accept, reject, or edit the automated findings before continuing.",
+                next_command=f"review-ticket {issue} attach",
+                report_path=str(review_dir / "reviewer-report.md"),
+            )
+        if human.get("rejected_review"):
+            return StepResult(
+                step="human-review",
+                outcome=Outcome.REVIEW_DECISION,
+                summary="The automated review was rejected locally. Regenerate or import a new review.",
+                next_command=f"review-ticket {issue} run-review --revise",
+                report_path=str(review_dir / "findings.json"),
+            )
         session["last_completed_step"] = "automated-review"
         app.store.save_session(session)
         return None
@@ -1707,32 +1974,13 @@ def step_publication(app: App, session: dict[str, Any]) -> StepResult | None:
     identity = _require_identity(session)
     sha = session["active_sha"]
     review_dir = _review_dir(app, issue, identity, sha)
-    human = read_json(review_dir / "human-review.json")
-    if not human:
-        return StepResult(
-            step="human-review",
-            outcome=Outcome.REVIEW_DECISION,
-            summary="Accept, reject, or edit the automated findings before publication.",
-            next_command=f"review-ticket {issue} attach",
-            report_path=str(review_dir / "reviewer-report.md"),
-        )
-    if human.get("rejected_review"):
-        return StepResult(
-            step="human-review",
-            outcome=Outcome.REVIEW_DECISION,
-            summary="The automated review was rejected locally and has not been published.",
-            next_command=f"review-ticket {issue} run-review --revise",
-            report_path=str(review_dir / "findings.json"),
-        )
     publication = read_json(review_dir / "publication.json")
     if not publication:
-        return StepResult(
-            step="human-review",
-            outcome=Outcome.REVIEW_DECISION,
-            summary="The local review is ready to publish. GitHub has not been changed.",
-            next_command=f"review-ticket {issue} publish-review --yes",
-            report_path=str(review_dir / "proposed-review.json"),
-        )
+        session["publication_state"] = "pending"
+        app.store.save_session(session)
+        return None
+    session["publication_state"] = publication.get("status") or "recorded"
+    app.store.save_session(session)
     return _publication_gate(app, issue, sha, publication)
 
 
@@ -2078,10 +2326,20 @@ def _write_review_preview_markdown(
     )
 
 
-def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, imported: Any | None) -> StepResult:
+def _execute_reviewer(
+    app: App,
+    session: dict[str, Any],
+    *,
+    revise: bool,
+    imported: Any | None,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = session["issue"]
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    resolved_identity = identity or _require_identity(session)
+    resolved_sha = sha or session["active_sha"]
+    identity = resolved_identity
+    sha = resolved_sha
     review_dir = _review_dir(app, issue, identity, sha)
     if any((review_dir / name).exists() for name in ("findings.json", "human-review.json")) and not revise:
         raise WorkflowError("A review already exists for this SHA. Pass --revise to archive it and run again.")
@@ -2089,11 +2347,11 @@ def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, import
         _archive_review(review_dir)
     repository = f"{identity[0]}/{identity[1]}"
     _LOG.debug("preparing review context for %s @ %s", repository, sha)
-    diff_text = _ensure_diff(app, session)
+    diff_text = _ensure_diff(app, session, identity=identity, sha=sha)
     index = parse_unified_diff(diff_text)
     write_json(review_dir / "diff-lines.json", sorted([list(item) for item in index]))
     output = review_dir / "reviewer-output.json"
-    context = _write_context(app, session, diff_text, output)
+    context = _write_context(app, session, diff_text, output, identity=identity, sha=sha)
     reviewer_command, reviewer_route, reviewer_profile = app.config.resolve_reviewer(repository)
     if imported is None:
         if not reviewer_command:
@@ -2191,10 +2449,16 @@ def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, import
     )
 
 
-def _ensure_diff(app: App, session: dict[str, Any]) -> str:
+def _ensure_diff(
+    app: App,
+    session: dict[str, Any],
+    *,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> str:
     issue = session["issue"]
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    identity = identity or _require_identity(session)
+    sha = sha or session["active_sha"]
     commit_dir = _commit_dir(app, issue, identity, sha)
     existing = commit_dir / "diff.patch"
     if existing.exists() and (commit_dir / "review" / "diff-lines.json").exists():
@@ -2221,10 +2485,18 @@ def _ensure_diff(app: App, session: dict[str, Any]) -> str:
     return diff_text
 
 
-def _write_context(app: App, session: dict[str, Any], diff_text: str, output: Path) -> Path:
+def _write_context(
+    app: App,
+    session: dict[str, Any],
+    diff_text: str,
+    output: Path,
+    *,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> Path:
     issue = session["issue"]
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    identity = identity or _require_identity(session)
+    sha = sha or session["active_sha"]
     context = _review_dir(app, issue, identity, sha) / "context"
     normalized = read_json(app.store.issue_dir(issue) / "issue.json") or {}
     write_text(
@@ -2280,6 +2552,27 @@ def _previous_finding_rows(app: App, issue: str, identity: tuple[str, str, int],
     return rows
 
 
+def _inline_findings_off_diff(
+    findings: list[dict[str, Any]],
+    diff_index: set[tuple[str, int, str]],
+) -> str:
+    for finding in findings:
+        if finding.get("decision") == "reject":
+            continue
+        path = finding.get("path")
+        line = finding.get("line")
+        if not path or not isinstance(line, int):
+            continue
+        side = finding.get("side") or "RIGHT"
+        if (path, line, side) not in diff_index:
+            return (
+                f"Refusing to publish. Finding {finding.get('id', '')} targets {path}:{line}, "
+                "which is not on the diff for this SHA. Run run-review on the current HEAD "
+                "or revise the review for the new revision."
+            )
+    return ""
+
+
 def _diff_index(app: App, issue: str, identity: tuple[str, str, int], sha: str) -> set[tuple[str, int, str]]:
     review_dir = _review_dir(app, issue, identity, sha)
     stored = read_json(review_dir / "diff-lines.json")
@@ -2315,8 +2608,8 @@ def _build_checklist(app: App, session: dict[str, Any]) -> list[dict[str, Any]]:
         except WorkflowError:
             merged = []
         open_must_fix = any(item.get("must_fix") and item.get("decision") != "reject" for item in merged)
-    publication = read_json(commit_dir / "review" / "publication.json") or {}
-    human_done = bool(human) and not human.get("rejected_review") and publication.get("status") in {"success", "skipped"}
+    manual = read_json(commit_dir / "review" / "manual-review.json") or {}
+    manual_done = bool(manual.get("completed"))
     results = read_json(commit_dir / "testing" / "test-results.json") or {}
     environment = read_json(commit_dir / "testing" / "environment.json") or {}
     testing_passed = results.get("result") == "pass" and results.get("sha") == sha
@@ -2332,7 +2625,7 @@ def _build_checklist(app: App, session: dict[str, Any]) -> list[dict[str, Any]]:
             "checks_passed": checks,
             "analyzers_clear": analyzers_clear,
             "open_must_fix": open_must_fix,
-            "human_review": human_done,
+            "manual_review": manual_done,
             "testing_passed": testing_passed,
             "evidence_matches": bool(evidence),
         }
@@ -2352,13 +2645,19 @@ def _after_publication(app: App, issue: str, sha: str, receipt: dict[str, Any], 
             details={"completed_step": "human-review", "github_review_id": receipt.get("github_review_id")},
         )
     summary = prefix + " The issue stays in Peer Review."
+    next_command = f"review-ticket {issue} disposition --choice approve"
+    step = "disposition"
     if event == "APPROVE":
-        summary = prefix + " Continue with local testing. A GitHub approval is not a Jira transition."
+        summary = prefix + " Functional testing should already be recorded for Approve."
+    elif event == "COMMENT":
+        summary = prefix + " Continue functional testing or publish a final review when ready."
+        next_command = f"review-ticket {issue} test record --result pass"
+        step = "functional-testing"
     return StepResult(
-        step="virtualization",
+        step=step,
         outcome=Outcome.READY,
         summary=summary,
-        next_command=f"review-ticket {issue} test prepare",
+        next_command=next_command,
         details={"completed_step": "human-review", "github_review_id": receipt.get("github_review_id"), "sha": sha},
     )
 
@@ -2661,6 +2960,32 @@ def _selected(session: dict[str, Any]) -> tuple[str, str, int] | None:
     return parse_pr_ref(active)
 
 
+def _pr_ref_from_identity(identity: tuple[str, str, int]) -> str:
+    return f"{identity[0]}/{identity[1]}#{identity[2]}"
+
+
+def _resolve_workflow_target(
+    session: dict[str, Any],
+    *,
+    pr_ref: str | None = None,
+    sha: str | None = None,
+) -> tuple[tuple[str, str, int], str]:
+    if pr_ref:
+        identity = parse_pr_ref(pr_ref)
+        ref = _pr_ref_from_identity(identity)
+    else:
+        identity = _require_identity(session)
+        ref = _pr_ref_from_identity(identity)
+    if sha:
+        resolved_sha = sha
+    else:
+        pr_shas = session.get("pr_shas") or {}
+        resolved_sha = str(pr_shas.get(ref) or session.get("active_sha") or "")
+    if not resolved_sha:
+        raise WorkflowError("This command needs a SHA. Pass --sha or refresh the pull request.")
+    return identity, resolved_sha
+
+
 def _require_identity(session: dict[str, Any]) -> tuple[str, str, int]:
     identity = _selected(session)
     if identity is None or not session.get("active_sha"):
@@ -2688,6 +3013,35 @@ def _maybe_commit_dir(app: App, session: dict[str, Any]) -> Path | None:
 
 def _review_dir(app: App, issue: str, identity: tuple[str, str, int], sha: str) -> Path:
     return _commit_dir(app, issue, identity, sha) / "review"
+
+
+def _readiness_return_blocks(app: App, issue: str) -> list[dict[str, Any]]:
+    projection = project_readiness_gate(app.store, issue, app.config)
+    blocks: list[dict[str, Any]] = []
+    for item in projection.attention:
+        blocks.append(
+            {
+                "ref": item.ref,
+                "sha": item.sha,
+                "url": item.url,
+                "lines": list(item.lines),
+                "links": list(item.links),
+            }
+        )
+    return blocks
+
+
+def _write_readiness_return_draft(app: App, issue: str, *, notes: str) -> Path:
+    blocks = _readiness_return_blocks(app, issue)
+    body = readiness_return_draft(
+        issue=issue,
+        in_progress_status=app.config.in_progress_status,
+        blocks=blocks,
+        notes=notes,
+    )
+    path = app.store.issue_dir(issue) / "return-comment.md"
+    write_text(path, body)
+    return path
 
 
 def _write_return_draft(app: App, issue: str, *, reason: str, notes: str, links: list[str]) -> Path:
@@ -2820,11 +3174,11 @@ def _review_chain_hint(issue: str, result: StepResult) -> str:
     ):
         return (
             f"chain: {prefix} run-review → {prefix} import-review → "
-            f"{prefix} attach → {prefix} publish-review --yes"
+            f"{prefix} attach → {prefix} test prepare → {prefix} publish-review --yes"
         )
     return (
         f"chain: {prefix} run-review → {prefix} attach → "
-        f"{prefix} publish-review --yes"
+        f"{prefix} test prepare → {prefix} publish-review --yes"
     )
 
 

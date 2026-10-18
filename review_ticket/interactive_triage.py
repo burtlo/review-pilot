@@ -44,6 +44,8 @@ class TriageState:
     findings: list[FindingState] = field(default_factory=list)
     summary: str = ""
     event: str | None = None
+    track_disposition: str | None = None
+    track_disposition_confirmed: bool = False
     rejected_review: bool = False
 
     def all_decided(self) -> bool:
@@ -86,6 +88,8 @@ def _triage_state_from_review_files(
         findings=rows,
         summary=str(existing.get("summary") or document.get("summary") or ""),
         event=existing.get("event"),
+        track_disposition=existing.get("track_disposition") or existing.get("event"),
+        track_disposition_confirmed=bool(existing.get("track_disposition_confirmed")),
         rejected_review=bool(existing.get("rejected_review")),
     )
 
@@ -158,13 +162,19 @@ def human_document_from_state(state: TriageState) -> dict[str, Any]:
         if item.explanation is not None and item.explanation != item.default_explanation:
             entry["explanation"] = item.explanation
         decisions[item.finding_id] = entry
-    return {
+    payload: dict[str, Any] = {
         "rejected_review": False,
         "findings": decisions,
         "added": [],
-        "event": state.event,
         "summary": state.summary,
     }
+    disposition = state.track_disposition or state.event
+    if disposition:
+        payload["track_disposition"] = disposition
+        payload["event"] = disposition
+    if state.track_disposition_confirmed:
+        payload["track_disposition_confirmed"] = True
+    return payload
 
 
 def _format_counts(inline: int, summary_only: int) -> str:
@@ -260,12 +270,28 @@ def set_summary(state: TriageState, summary: str) -> None:
 def set_event(state: TriageState, event: str | None) -> None:
     if event is None or not str(event).strip():
         state.event = None
+        state.track_disposition = None
+        state.track_disposition_confirmed = False
         return
     text = str(event).strip().upper()
     if text in {"COMMENT", "APPROVE", "REQUEST_CHANGES"}:
         state.event = text
+        state.track_disposition = text
+        state.track_disposition_confirmed = text != "REQUEST_CHANGES"
         return
     raise WorkflowError("event must be COMMENT, APPROVE, or REQUEST_CHANGES.")
+
+
+def set_track_disposition(state: TriageState, disposition: str, *, confirmed: bool = False) -> None:
+    text = disposition.strip().upper()
+    if text not in {"COMMENT", "APPROVE", "REQUEST_CHANGES"}:
+        raise WorkflowError("Disposition must be APPROVE, COMMENT, or REQUEST_CHANGES.")
+    state.track_disposition = text
+    state.event = text
+    if text == "REQUEST_CHANGES":
+        state.track_disposition_confirmed = confirmed
+    else:
+        state.track_disposition_confirmed = True
 
 
 def reject_automated_review(state: TriageState) -> None:

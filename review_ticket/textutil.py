@@ -327,6 +327,79 @@ def normalize_comments(payload: Any) -> list[dict[str, str]]:
     return comments
 
 
+def diff_excerpt(
+    diff: str,
+    path: str,
+    line: int | None,
+    *,
+    context_lines: int = 3,
+) -> str:
+    """Return a small unified-diff excerpt around ``path`` and ``line``."""
+
+    if not diff.strip() or not path:
+        return ""
+    normalized = path[2:] if path.startswith("b/") else path
+    file_lines: list[str] = []
+    current_path: str | None = None
+    capture = False
+    hunk = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    for raw in diff.splitlines():
+        if raw.startswith("diff --git "):
+            current_path = None
+            capture = False
+            file_lines = []
+            continue
+        if raw.startswith("+++ "):
+            name = raw[4:].strip()
+            current_path = None if name == "/dev/null" else name[2:] if name.startswith("b/") else name
+            capture = current_path == normalized
+            file_lines = []
+            continue
+        if not capture:
+            continue
+        file_lines.append(raw)
+    if not file_lines:
+        return ""
+    if line is None:
+        return "\n".join(file_lines[: min(len(file_lines), context_lines * 2 + 4)])
+    new_line = 0
+    old_line = 0
+    for index, raw in enumerate(file_lines):
+        match = hunk.match(raw)
+        if match:
+            old_line = int(match.group(1))
+            new_line = int(match.group(2))
+            continue
+        if raw.startswith("+++") or raw.startswith("---"):
+            continue
+        on_new = new_line
+        on_old = old_line
+        if raw.startswith(" "):
+            if on_new == line:
+                start = max(0, index - context_lines)
+                end = min(len(file_lines), index + context_lines + 1)
+                return "\n".join(file_lines[start:end])
+            new_line += 1
+            old_line += 1
+        elif raw.startswith("+") and not raw.startswith("+++"):
+            if on_new == line:
+                start = max(0, index - context_lines)
+                end = min(len(file_lines), index + context_lines + 1)
+                return "\n".join(file_lines[start:end])
+            new_line += 1
+        elif raw.startswith("-") and not raw.startswith("---"):
+            if on_old == line:
+                start = max(0, index - context_lines)
+                end = min(len(file_lines), index + context_lines + 1)
+                return "\n".join(file_lines[start:end])
+            old_line += 1
+    return "\n".join(file_lines[: min(len(file_lines), context_lines * 2 + 4)])
+
+
+def normalize_comment_body(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip()).casefold()
+
+
 def parse_unified_diff(diff: str) -> set[tuple[str, int, str]]:
     """Return file lines that GitHub can attach a review comment to."""
 

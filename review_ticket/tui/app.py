@@ -5,7 +5,9 @@ from __future__ import annotations
 from textual.app import App
 
 from review_ticket.storage import Store, read_json
+from review_ticket.tui.hub_screen import ReviewHubScreen, should_auto_present_hub
 from review_ticket.tui.status_screen import StatusScreen
+from review_ticket.tui.readiness_screen import ReadinessScreen, should_auto_present_readiness
 from review_ticket.tui.testing_notes_screen import TestingNotesScreen, should_auto_present_testing_notes
 from review_ticket.workflow import App as WorkflowApp
 
@@ -37,3 +39,7 @@ class ReviewTicketApp(App[None]):
         self.push_screen(StatusScreen(self.store, self.issue))
         if self.workflow_app is not None and should_auto_present_testing_notes(session):
             self.push_screen(TestingNotesScreen(self.store, self.issue, self.workflow_app))
+        elif self.workflow_app is not None and should_auto_present_readiness(session):
+            self.push_screen(ReadinessScreen(self.store, self.issue, self.workflow_app))
+        elif should_auto_present_hub(session):
+            self.push_screen(ReviewHubScreen(self.store, self.issue, self.workflow_app))

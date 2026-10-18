@@ -449,6 +449,42 @@ def reviewer_report(document: dict[str, Any], findings: list[dict[str, Any]], re
     return "\n".join(lines).rstrip() + "\n"
 
 
+def readiness_return_draft(
+    *,
+    issue: str,
+    in_progress_status: str,
+    blocks: list[dict[str, Any]],
+    notes: str = "",
+) -> str:
+    """Jira return text citing only PRs that still need readiness/analyzer attention."""
+
+    if not blocks:
+        reason = "Readiness or analyzer findings still need attention before peer review can continue."
+    else:
+        sections: list[str] = []
+        for block in blocks:
+            ref = block.get("ref") or "pull request"
+            sha = block.get("sha") or ""
+            pr_url = block.get("url") or ""
+            header = f"{ref}"
+            if sha:
+                header += f" — SHA `{sha[:12]}`"
+            if pr_url:
+                header += f" ({pr_url})"
+            lines = block.get("lines") or []
+            body = "\n".join(lines) if lines else "_See the readiness report for details._"
+            sections.append(f"### {header}\n\n{body}")
+        reason = (
+            f"Requesting that {issue} return to **{in_progress_status}**.\n\n"
+            + "\n\n".join(sections)
+            + "\n\nThe ticket can be reviewed again after the blocking findings are resolved."
+        )
+    links: list[str] = []
+    for block in blocks:
+        links.extend(block.get("links") or [])
+    return return_comment(issue=issue, reason=reason, notes=notes, links=links)
+
+
 def return_comment(*, issue: str, reason: str, notes: str, links: list[str] | None = None) -> str:
     extra = ""
     if links:
@@ -504,12 +540,27 @@ def test_results_markdown(result: dict[str, Any]) -> str:
     evidence_lines = [f"- `{item}`" for item in evidence] or ["- None."]
     scenarios = result.get("scenarios") or []
     scenario_lines = [f"- {item}" for item in scenarios] or ["- None recorded."]
+    disposition = result.get("disposition") or "n/a"
     return f"""# Test results `{result.get('sha')}`
 
 Result: **{result.get('result')}**
 Failure kind: {result.get('failure_kind') or 'n/a'}
+Reviewer disposition: **{disposition}**
 Image: `{result.get('image') or ''}`
 Digest: `{result.get('digest') or ''}`
+Plan reference: {result.get('plan_reference') or 'n/a'}
+
+## Steps
+
+{result.get('steps') or '_No steps recorded._'}
+
+## Observed
+
+{result.get('observed') or '_No observed result._'}
+
+## Expected
+
+{result.get('expected') or '_No expected result._'}
 
 ## Scenarios
 

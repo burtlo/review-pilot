@@ -50,6 +50,8 @@ def test_status_screen_renders_three_pr_fixture(tmp_path):
             assert isinstance(app.screen, StatusScreen)
             text = app.screen.query_one("#status-doc", Markdown).source
             assert ISSUE in text
+            assert "Reject negative quantities" in text
+            assert "Session last updated (local):" in text
             assert "human-review" in text
             assert "analyzer-findings" in text
             assert "REVIEW_DECISION" in text
@@ -61,10 +63,17 @@ def test_status_screen_renders_three_pr_fixture(tmp_path):
             assert "Human review recorded" in text
             assert "Undecided" in text
             assert "No snapshot" in text
+            assert "**Tracks:** automated complete_locally" in text
+            assert "GitHub publication (receipt):" in text
+            assert "COMMENT" in text
+            assert "Snapshot captured (local):" in text
+            assert app.screen.sub_title == f"{ISSUE} — Reject negative quantities"
             pr_list = app.screen.query_one("#pr-list")
             assert len(list(pr_list.children)) == 3
             row = pr_list.children[0].query_one(Markdown).source
             assert row.startswith("[acme/widgets#87](https://github.com/acme/widgets/pull/87)")
+            assert "Reject negative quantities" in row
+            assert "complete_locally" in row
             assert row.count("https://github.com/acme/widgets/pull/87") == 1
             assert "**Link:**" not in text
 

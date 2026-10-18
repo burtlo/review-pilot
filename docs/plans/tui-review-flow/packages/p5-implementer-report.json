@@ -1,0 +1,33 @@
+{
+  "package": "P5",
+  "title": "PR review hub",
+  "status": "completed",
+  "spec_sections": ["§7", "§14"],
+  "deliverables": [
+    "review_ticket/hub_projection.py — hub model via project_review_status / track_projection",
+    "review_ticket/tui/hub_format.py — markdown for PR blocks and track list",
+    "review_ticket/tui/hub_screen.py — ReviewHubScreen with ticket dock disabled until P12",
+    "review_ticket/tui/app.py — auto-present hub after readiness accept",
+    "review_ticket/tui/status_screen.py — h opens hub when gate satisfied",
+    "review_ticket/tui/readiness_screen.py — approve routes to hub"
+  ],
+  "tests": {
+    "commands": [
+      "pytest tests/test_tui_hub.py tests/test_hub_projection.py"
+    ],
+    "result": "7 passed"
+  },
+  "acceptance": {
+    "three_prs_three_track_rows": "pass",
+    "github_from_receipt_only": "pass",
+    "esc_no_session_write": "pass",
+    "ticket_dock_disabled_p12": "pass",
+    "no_active_pr_change": "pass"
+  },
+  "out_of_scope_deferred": [
+    "P6 automated preparation screen",
+    "P8 manual review screen",
+    "P11 functional testing screen",
+    "P12 ticket disposition wiring"
+  ]
+}
