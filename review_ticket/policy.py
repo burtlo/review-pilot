@@ -228,8 +228,8 @@ def disposition_checklist(facts: dict) -> list[dict]:
         ),
         (
             "human",
-            "A human reviewed the automated findings.",
-            bool(facts.get("human_review")),
+            "Manual code review is complete for this SHA.",
+            bool(facts.get("manual_review")),
         ),
         (
             "testing",
@@ -243,3 +243,210 @@ def disposition_checklist(facts: dict) -> list[dict]:
         ),
     ]
     return [{"id": key, "detail": detail, "ok": ok} for key, detail, ok in items]
+
+
+# Per pull-request HEAD SHA (spec §1.1, §2.1, §18). Paths are relative to commits/<sha>/.
+# Automated curation stays findings.json plus human-review.json. human-review.json is not
+# the manual code review. Manual review is manual-review.json. Functional testing stays
+# testing/test-results.json. GitHub history is publications.jsonl; publication.json is the
+# latest receipt so existing readers keep working.
+AUTOMATED_FINDINGS_FILE = "review/findings.json"
+AUTOMATED_CURATION_FILE = "review/human-review.json"
+MANUAL_REVIEW_FILE = "review/manual-review.json"
+FUNCTIONAL_RESULTS_FILE = "testing/test-results.json"
+PUBLICATION_RECEIPT_FILE = "review/publication.json"
+PUBLICATION_HISTORY_FILE = "review/publications.jsonl"
+
+# manual-review.json (writer is a later package). Checklist and status only require:
+# sha, completed, notes, findings (path, line, blocking, text), disposition, recorded_at.
+MANUAL_REVIEW_FIELDS = ("sha", "completed", "notes", "findings", "disposition", "recorded_at")
+
+TRACK_NOT_STARTED = "not_started"
+TRACK_IN_PROGRESS = "in_progress"
+TRACK_COMPLETE_LOCALLY = "complete_locally"
+TRACK_PUBLICATION_PENDING = "publication_pending"
+TRACK_PUBLISHED = "published"
+TRACK_STALE = "stale"
+TRACK_BLOCKED = "blocked"
+TRACK_RETURNED = "returned"
+TRACK_STATUS_VALUES = (
+    TRACK_NOT_STARTED,
+    TRACK_IN_PROGRESS,
+    TRACK_COMPLETE_LOCALLY,
+    TRACK_PUBLICATION_PENDING,
+    TRACK_PUBLISHED,
+    TRACK_STALE,
+    TRACK_BLOCKED,
+    TRACK_RETURNED,
+)
+TRACK_NAMES = ("automated", "manual", "functional", "publication")
+
+
+def _sha_mismatch(document: dict | None, sha: str) -> bool:
+    if not isinstance(document, dict):
+        return False
+    recorded = document.get("sha")
+    return bool(recorded) and recorded != sha
+
+
+def _is_request_changes(value: object) -> bool:
+    text = str(value or "").replace("-", "_").replace(" ", "_").upper()
+    return text == "REQUEST_CHANGES"
+
+
+def manual_review_is_complete(document: dict | None, sha: str) -> bool:
+    """True when manual-review.json records a completed inspection of this SHA."""
+    if not isinstance(document, dict) or not document.get("completed"):
+        return False
+    if _sha_mismatch(document, sha):
+        return False
+    return True
+
+
+def functional_digest_matches(
+    results: dict | None,
+    environment: dict | None,
+    sha: str,
+) -> bool:
+    """True when test-results digest matches environment.json for this SHA."""
+    if not isinstance(results, dict) or results.get("sha") != sha:
+        return False
+    if not isinstance(environment, dict) or environment.get("sha") != sha:
+        return False
+    recorded = results.get("digest")
+    current = environment.get("digest")
+    return bool(recorded) and bool(current) and recorded == current
+
+
+def functional_testing_passed(
+    results: dict | None,
+    sha: str,
+    environment: dict | None = None,
+) -> bool:
+    if not isinstance(results, dict):
+        return False
+    if results.get("result") != "pass" or results.get("sha") != sha:
+        return False
+    return functional_digest_matches(results, environment, sha)
+
+
+def publication_event_allowed(
+    event: str,
+    *,
+    sha: str,
+    manual_review: dict | None,
+    test_results: dict | None,
+    environment: dict | None = None,
+) -> tuple[bool, str]:
+    """Gate GitHub Approve and Comment on manual review; Approve also needs a functional pass.
+
+    Request Changes stays available before testing when the caller has a confirmed blocker.
+    An identical republish is handled by the caller before this predicate.
+    """
+    normalized = str(event or "").upper()
+    if normalized == "APPROVE":
+        if not functional_testing_passed(test_results, sha, environment):
+            return False, "GitHub Approve requires a passing functional test for this SHA."
+        if not manual_review_is_complete(manual_review, sha):
+            return False, "GitHub Approve requires a completed manual code review for this SHA."
+        return True, ""
+    if normalized == "COMMENT":
+        if not manual_review_is_complete(manual_review, sha):
+            return False, "GitHub Comment requires a completed manual code review for this SHA."
+        return True, ""
+    return True, ""
+
+
+def _automated_track_status(findings: dict | None, human_review: dict | None, sha: str) -> str:
+    if not findings:
+        return TRACK_NOT_STARTED
+    if _sha_mismatch(findings, sha) or _sha_mismatch(human_review, sha):
+        return TRACK_STALE
+    if not human_review or human_review.get("rejected_review"):
+        return TRACK_IN_PROGRESS
+    return TRACK_COMPLETE_LOCALLY
+
+
+def _manual_track_status(manual_review: dict | None, sha: str) -> str:
+    if not manual_review:
+        return TRACK_NOT_STARTED
+    if _sha_mismatch(manual_review, sha):
+        return TRACK_STALE
+    if _is_request_changes(manual_review.get("disposition")):
+        return TRACK_RETURNED
+    if manual_review.get("completed"):
+        return TRACK_COMPLETE_LOCALLY
+    return TRACK_IN_PROGRESS
+
+
+def _functional_track_status(
+    results: dict | None,
+    sha: str,
+    environment: dict | None = None,
+) -> str:
+    if not results:
+        return TRACK_NOT_STARTED
+    if _sha_mismatch(results, sha):
+        return TRACK_STALE
+    if results.get("completed") is False:
+        return TRACK_IN_PROGRESS
+    result = results.get("result")
+    kind = results.get("failure_kind")
+    if result == "blocked" or kind == "environment":
+        return TRACK_BLOCKED
+    if result == "fail":
+        return TRACK_RETURNED
+    if result == "pass":
+        if not functional_digest_matches(results, environment, sha):
+            return TRACK_IN_PROGRESS
+        return TRACK_COMPLETE_LOCALLY
+    return TRACK_IN_PROGRESS
+
+
+def _publication_track_status(
+    publication: dict | None,
+    human_review: dict | None,
+    manual_review: dict | None,
+    sha: str,
+) -> str:
+    if not publication:
+        ready = (isinstance(human_review, dict) and not human_review.get("rejected_review")) or manual_review_is_complete(
+            manual_review, sha
+        )
+        return TRACK_PUBLICATION_PENDING if ready else TRACK_NOT_STARTED
+    if _sha_mismatch(publication, sha):
+        return TRACK_STALE
+    status = publication.get("status")
+    if status in {"success", "skipped"}:
+        if _is_request_changes(publication.get("event")):
+            return TRACK_RETURNED
+        return TRACK_PUBLISHED
+    if status == "failure":
+        return TRACK_BLOCKED
+    return TRACK_IN_PROGRESS
+
+
+def classify_track_status(
+    *,
+    sha: str,
+    current_sha: str | None,
+    findings: dict | None,
+    human_review: dict | None,
+    manual_review: dict | None,
+    test_results: dict | None,
+    publication: dict | None,
+    environment: dict | None = None,
+) -> dict[str, str]:
+    """Status of the three tracks and GitHub publication for one PR SHA.
+
+    When current_sha is set and differs, the snapshot is historical (stale).
+    Publication is not inferred from a local draft.
+    """
+    if current_sha and current_sha != sha:
+        return {name: TRACK_STALE for name in TRACK_NAMES}
+    return {
+        "automated": _automated_track_status(findings, human_review, sha),
+        "manual": _manual_track_status(manual_review, sha),
+        "functional": _functional_track_status(test_results, sha, environment),
+        "publication": _publication_track_status(publication, human_review, manual_review, sha),
+    }

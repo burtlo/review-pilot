@@ -313,7 +313,8 @@ def test_automated_review_ready_handoff_lists_context_and_chain(tmp_path):
     assert "run-review" in output
     assert f"{ISSUE} attach" in output
     assert "review attach" not in output
-    assert "publish-review" in output
+    chain = output[output.index("chain:") :]
+    assert chain.index("test prepare") < chain.index("publish-review")
 
 
 def test_run_review_next_command_is_review_attach(tmp_path):
@@ -405,6 +406,11 @@ def test_reviewer_places_must_fix_inline_and_keeps_general_findings(tmp_path):
 def test_publish_rejects_stale_sha_and_does_not_post(tmp_path):
     app, runner, world = make_app(tmp_path)
     _seed_publishable(tmp_path, sha=SHA1)
+    review = _commit(tmp_path, SHA1) / "review"
+    write_json(
+        review / "publication-draft.json",
+        {"sha": SHA1, "event": "REQUEST_CHANGES", "summary": "Stale draft", "selection": {"F001": True}},
+    )
     world.head_sha = SHA2
     code = _run(app, [ISSUE, "publish-review", "--yes"])
     output = app.stdout.getvalue()
@@ -412,7 +418,42 @@ def test_publish_rejects_stale_sha_and_does_not_post(tmp_path):
     assert "outcome: BLOCKED" in output
     assert "Refusing to publish" in output
     assert posts(runner) == []
-    assert not (_commit(tmp_path, SHA1) / "review" / "publication.json").exists()
+    assert not (review / "publication.json").exists()
+    assert (review / "publication-draft.json").exists()
+
+
+def test_failed_github_review_keeps_draft_and_no_success_receipt(tmp_path):
+    app, runner, world = make_app(tmp_path)
+    _seed_publishable(tmp_path, sha=SHA1)
+    world.head_sha = SHA1
+    world.review_post_code = 1
+    review = _commit(tmp_path, SHA1) / "review"
+    write_json(
+        review / "manual-review.json",
+        {
+            "sha": SHA1,
+            "completed": True,
+            "notes": "Inspected manually.",
+            "findings": [],
+            "disposition": "COMMENT",
+            "recorded_at": "2026-10-18T00:00:00Z",
+        },
+    )
+    write_json(
+        review / "publication-draft.json",
+        {"sha": SHA1, "event": "COMMENT", "summary": "Draft body", "selection": {"F001": True}},
+    )
+    code = _run(app, [ISSUE, "publish-review", "--yes", "--event", "COMMENT"])
+    assert code == 2
+    assert "outcome: BLOCKED" in app.stdout.getvalue()
+    assert not (review / "publication.json").exists()
+    assert (review / "publication-draft.json").exists()
+    assert not (review / "publications.jsonl").exists()
+    actions_path = tmp_path / "reviews" / ISSUE / "actions.jsonl"
+    assert actions_path.exists()
+    actions_text = actions_path.read_text(encoding="utf-8")
+    assert "github.review" in actions_text
+    assert '"status": "failure"' in actions_text or '"status":"failure"' in actions_text
 
 
 def test_repeat_publication_does_not_create_a_second_review(tmp_path):

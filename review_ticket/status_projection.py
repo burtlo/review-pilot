@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from review_ticket.policy import classify_track_status
 from review_ticket.storage import Store, read_json
 from review_ticket.util import parse_pr_ref, require_issue_key, short_sha
 
@@ -42,6 +43,54 @@ class ReviewProgress:
 
 
 @dataclass(frozen=True)
+class HistoricalSnapshot:
+    """An earlier SHA retained after HEAD moved. Read-only for later screens."""
+
+    sha: str
+    superseded_by: str
+    read_only: bool
+    tracks: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class PrFreshness:
+    """Stale versus current for one pull request.
+
+    ``current`` describes the stored HEAD. ``stale`` is true when that PR has
+    historical SHAs. This is separate from ``SnapshotSelection.stale``, which
+    means the open findings file is not the stored SHA.
+    """
+
+    ref: str
+    current_sha: str
+    current: bool
+    stale: bool
+    historical: tuple[HistoricalSnapshot, ...]
+    tracks: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class ArtifactTimestamps:
+    """Known timestamp fields from on-disk artifacts for one commit."""
+
+    captured_at: str | None
+    checks_captured_at: str | None
+    curated_at: str | None
+    manual_recorded_at: str | None
+    testing_recorded_at: str | None
+    published_at: str | None
+
+
+@dataclass(frozen=True)
+class PublicationReceipt:
+    """GitHub publication from review/publication.json only — not local disposition."""
+
+    event: str | None
+    status: str | None
+    published_at: str | None
+
+
+@dataclass(frozen=True)
 class PrStatusRow:
     ref: str
     owner: str
@@ -52,13 +101,19 @@ class PrStatusRow:
     progress: ReviewProgress
     checks: PrChecks
     snapshot: SnapshotSelection
+    freshness: PrFreshness
+    tracks: tuple[tuple[str, str], ...]
+    publication: PublicationReceipt | None
+    timestamps: ArtifactTimestamps
 
 
 @dataclass(frozen=True)
 class StatusProjection:
     issue: str
+    issue_title: str | None
     session_exists: bool
     missing_session_message: str | None
+    session_last_updated: str | None
     current_step: str | None
     last_completed_step: str | None
     outcome: str | None
@@ -73,8 +128,10 @@ def project_review_status(store: Store, issue: str) -> StatusProjection:
     if not session_path.exists():
         return StatusProjection(
             issue=issue_key,
+            issue_title=None,
             session_exists=False,
             missing_session_message="No review session exists yet.",
+            session_last_updated=None,
             current_step=None,
             last_completed_step=None,
             outcome=None,
@@ -82,6 +139,9 @@ def project_review_status(store: Store, issue: str) -> StatusProjection:
             pr_rows=(),
         )
     session = read_json(session_path) or {}
+    issue_doc = read_json(store.issue_dir(issue_key) / "issue.json") or {}
+    issue_title = str(issue_doc.get("summary") or issue_doc.get("title") or "").strip() or None
+    freshness_by_ref = {item.ref: item for item in project_pr_freshness(store, issue_key)}
     refs = _active_pr_refs(session)
     pr_rows: list[PrStatusRow] = []
     for ref in refs:
@@ -89,6 +149,7 @@ def project_review_status(store: Store, issue: str) -> StatusProjection:
         stored_sha = _stored_sha(session, ref)
         identity = (owner, repo, number)
         open_sha, stale = _select_open_snapshot(store, issue_key, identity, stored_sha)
+        freshness = freshness_by_ref[ref]
         pr_rows.append(
             PrStatusRow(
                 ref=ref,
@@ -100,18 +161,71 @@ def project_review_status(store: Store, issue: str) -> StatusProjection:
                 progress=_review_progress(store, issue_key, identity, stored_sha),
                 checks=_load_checks(store, issue_key, identity, stored_sha),
                 snapshot=SnapshotSelection(stored_sha=stored_sha, open_sha=open_sha, stale=stale),
+                freshness=freshness,
+                tracks=freshness.tracks,
+                publication=_publication_receipt(store, issue_key, identity, stored_sha),
+                timestamps=_artifact_timestamps(store, issue_key, identity, stored_sha),
             )
         )
     return StatusProjection(
         issue=issue_key,
+        issue_title=issue_title,
         session_exists=True,
         missing_session_message=None,
+        session_last_updated=str(session.get("last_updated") or "") or None,
         current_step=session.get("current_step"),
         last_completed_step=session.get("last_completed_step"),
         outcome=session.get("outcome"),
         next_command=session.get("next_command"),
         pr_rows=tuple(pr_rows),
     )
+
+
+def project_pr_freshness(store: Store, issue: str) -> tuple[PrFreshness, ...]:
+    """Local stale-versus-current rows for later hub and status screens.
+
+    Does not call GitHub or Jira. A findings file that is not the stored SHA
+    is not, by itself, a HEAD move.
+    """
+
+    issue_key = require_issue_key(issue)
+    session_path = store.issue_dir(issue_key) / "session.json"
+    if not session_path.exists():
+        return ()
+    session = read_json(session_path) or {}
+    rows: list[PrFreshness] = []
+    for ref in _active_pr_refs(session):
+        owner, repo, number = parse_pr_ref(ref)
+        current_sha = _stored_sha(session, ref)
+        identity = (owner, repo, number)
+        historical = _historical_snapshots(store, issue_key, identity, session, ref, current_sha)
+        rows.append(
+            PrFreshness(
+                ref=ref,
+                current_sha=current_sha,
+                current=True,
+                stale=bool(historical),
+                historical=tuple(historical),
+                tracks=_track_pairs(store, issue_key, identity, current_sha, current_sha),
+            )
+        )
+    return tuple(rows)
+
+
+def format_pr_freshness(item: PrFreshness) -> str:
+    """One line: the stored HEAD is current, and older SHAs are stale."""
+
+    head = short_sha(item.current_sha) if item.current_sha else "unknown"
+    if not item.historical:
+        return f"current {head}"
+    older = ", ".join(f"{short_sha(entry.sha)} stale" for entry in item.historical)
+    return f"current {head}; {older}"
+
+
+def snapshot_is_historical(item: PrFreshness | None, sha: str) -> bool:
+    if item is None or not sha:
+        return False
+    return any(entry.sha == sha and entry.read_only for entry in item.historical)
 
 
 def pr_url_for_ref(store: Store, issue: str, ref: str) -> str:
@@ -197,6 +311,123 @@ def _load_checks(
         outcome=str(outcome) if outcome is not None else None,
         summary=str(summary) if summary is not None else None,
         rows=tuple(rows),
+    )
+
+
+def _historical_snapshots(
+    store: Store,
+    issue: str,
+    identity: tuple[str, str, int],
+    session: dict[str, Any],
+    ref: str,
+    current_sha: str,
+) -> list[HistoricalSnapshot]:
+    found: dict[str, str] = {}
+    history = session.get("sha_history") or {}
+    if isinstance(history, dict):
+        for item in history.get(ref) or []:
+            if isinstance(item, dict) and item.get("historical") and item.get("sha"):
+                found[str(item["sha"])] = str(item.get("superseded_by") or current_sha)
+    owner, repo, number = identity
+    commits = store.pr_dir(issue, owner, repo, number) / "commits"
+    if commits.exists():
+        for path in commits.iterdir():
+            if not path.is_dir():
+                continue
+            marker = read_json(path / "historical.json")
+            if isinstance(marker, dict) and marker.get("historical") and marker.get("sha"):
+                found[str(marker["sha"])] = str(marker.get("superseded_by") or current_sha)
+    found.pop(current_sha, None)
+    snapshots: list[HistoricalSnapshot] = []
+    for sha, superseded_by in sorted(found.items()):
+        snapshots.append(
+            HistoricalSnapshot(
+                sha=sha,
+                superseded_by=superseded_by,
+                read_only=True,
+                tracks=_track_pairs(store, issue, identity, sha, current_sha),
+            )
+        )
+    return snapshots
+
+
+def _track_pairs(
+    store: Store,
+    issue: str,
+    identity: tuple[str, str, int],
+    sha: str,
+    current_sha: str | None,
+) -> tuple[tuple[str, str], ...]:
+    if not sha:
+        return ()
+    owner, repo, number = identity
+    commit = store.commit_dir(issue, owner, repo, number, sha)
+    review = commit / "review"
+    testing = commit / "testing"
+    status = classify_track_status(
+        sha=sha,
+        current_sha=current_sha,
+        findings=read_json(review / "findings.json"),
+        human_review=read_json(review / "human-review.json"),
+        manual_review=read_json(review / "manual-review.json"),
+        test_results=read_json(testing / "test-results.json"),
+        publication=read_json(review / "publication.json"),
+        environment=read_json(testing / "environment.json"),
+    )
+    return tuple(status.items())
+
+
+def _publication_receipt(
+    store: Store,
+    issue: str,
+    identity: tuple[str, str, int],
+    sha: str,
+) -> PublicationReceipt | None:
+    if not sha:
+        return None
+    owner, repo, number = identity
+    payload = read_json(store.commit_dir(issue, owner, repo, number, sha) / "review" / "publication.json")
+    if not payload:
+        return None
+    event = payload.get("event")
+    status = payload.get("status")
+    published_at = payload.get("published_at")
+    return PublicationReceipt(
+        event=str(event) if event is not None else None,
+        status=str(status) if status is not None else None,
+        published_at=str(published_at) if published_at is not None else None,
+    )
+
+
+def _artifact_timestamps(
+    store: Store,
+    issue: str,
+    identity: tuple[str, str, int],
+    sha: str,
+) -> ArtifactTimestamps:
+    if not sha:
+        return ArtifactTimestamps(None, None, None, None, None, None)
+    owner, repo, number = identity
+    commit = store.commit_dir(issue, owner, repo, number, sha)
+    review = commit / "review"
+    snapshot = read_json(commit / "snapshot.json") or {}
+    checks = read_json(commit / "github-checks.json") or {}
+    human = read_json(review / "human-review.json") or {}
+    manual = read_json(review / "manual-review.json") or {}
+    testing = read_json(commit / "testing" / "test-results.json") or {}
+    publication = read_json(review / "publication.json") or {}
+
+    def _at(document: dict, key: str) -> str | None:
+        value = document.get(key)
+        return str(value) if value else None
+
+    return ArtifactTimestamps(
+        captured_at=_at(snapshot, "captured_at"),
+        checks_captured_at=_at(checks, "captured_at"),
+        curated_at=_at(human, "recorded_at"),
+        manual_recorded_at=_at(manual, "recorded_at"),
+        testing_recorded_at=_at(testing, "recorded_at"),
+        published_at=_at(publication, "published_at"),
     )
 
 

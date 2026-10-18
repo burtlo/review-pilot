@@ -368,3 +368,68 @@ def parse_unified_diff(diff: str) -> set[tuple[str, int, str]]:
                 new_line += 1
                 old_line += 1
     return locations
+
+
+def unified_diff_excerpt(
+    diff: str,
+    path: str,
+    line: int,
+    *,
+    side: str = "RIGHT",
+    context: int = 3,
+) -> str | None:
+    """Return numbered diff lines around ``line`` in ``path``, or None if not found."""
+
+    if not diff.strip() or not path or not isinstance(line, int):
+        return None
+    side = side or "RIGHT"
+    hunk = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    current_path: str | None = None
+    old_line = 0
+    new_line = 0
+    rows: list[tuple[int, str]] = []
+    for raw in diff.splitlines():
+        if raw.startswith("diff --git "):
+            current_path = None
+            rows = []
+            continue
+        if raw.startswith("+++ "):
+            header = raw[4:].strip()
+            current_path = None if header == "/dev/null" else header[2:] if header.startswith("b/") else header
+            rows = []
+            continue
+        if (
+            raw.startswith("--- ")
+            or raw.startswith("index ")
+            or raw.startswith("new file")
+            or raw.startswith("deleted file")
+        ):
+            continue
+        match = hunk.match(raw)
+        if match:
+            old_line = int(match.group(1))
+            new_line = int(match.group(2))
+            continue
+        if current_path != path:
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            number = new_line if side == "RIGHT" else old_line
+            rows.append((number, f"+{raw[1:]}"))
+            new_line += 1
+        elif raw.startswith("-") and not raw.startswith("---"):
+            number = old_line if side == "LEFT" else new_line
+            rows.append((number, f"-{raw[1:]}"))
+            old_line += 1
+        elif raw.startswith(" "):
+            rows.append((new_line if side == "RIGHT" else old_line, f" {raw[1:]}"))
+            new_line += 1
+            old_line += 1
+    if not rows:
+        return None
+    numbers = [item[0] for item in rows]
+    if line not in numbers:
+        return None
+    index = numbers.index(line)
+    start = max(0, index - context)
+    end = min(len(rows), index + context + 1)
+    return "\n".join(f"{num:>4} {text}" for num, text in rows[start:end])

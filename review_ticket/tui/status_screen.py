@@ -5,18 +5,28 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Footer, Header, ListItem, ListView, Markdown
+from textual.widgets import Button, Footer, Header, ListItem, ListView, Markdown
 
 from review_ticket.storage import Store
-from review_ticket.status_projection import PrStatusRow, StatusProjection, project_review_status
+from review_ticket.status_projection import (
+    PrStatusRow,
+    StatusProjection,
+    project_review_status,
+    snapshot_is_historical,
+)
+from review_ticket.tui.hub_screen import ReviewHubScreen
 from review_ticket.tui.pr_screen import PrReviewScreen
 from review_ticket.tui.status_format import format_pr_list_label, format_status_document
+from review_ticket.workflow import resume
 
 
 class StatusScreen(Screen[None]):
     """Read-only session status; PR rows open the review screen without writing session."""
 
-    BINDINGS = [("q", "quit_status", "Quit")]
+    BINDINGS = [
+        ("q", "quit_status", "Quit"),
+        ("h", "open_review_hub", "Hub"),
+    ]
 
     CSS = """
     StatusScreen {
@@ -36,6 +46,11 @@ class StatusScreen(Screen[None]):
         height: 1fr;
         layout: vertical;
         overflow: hidden;
+    }
+    StatusScreen #refresh-btn {
+        height: auto;
+        margin: 0 1;
+        width: 1fr;
     }
     StatusScreen #status-scroll {
         height: 1fr;
@@ -105,10 +120,34 @@ class StatusScreen(Screen[None]):
         yield Header()
         yield Footer()
         with Vertical(id="screen-fill"):
+            yield Button("Refresh", id="refresh-btn")
+            yield Button("Open review hub", id="hub-btn")
             with VerticalScroll(id="status-scroll"):
                 yield Markdown("", id="status-doc")
             with Vertical(id="pr-panel"):
                 yield ListView(id="pr-list")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "refresh-btn":
+            event.stop()
+            self._refresh()
+            return
+        if event.button.id == "hub-btn":
+            event.stop()
+            self.action_open_review_hub()
+
+    def action_open_review_hub(self) -> None:
+        workflow = getattr(self.app, "workflow_app", None)
+        self.app.push_screen(ReviewHubScreen(self._store, self._issue, workflow))
+
+    def _refresh(self) -> None:
+        """Re-run resume only when the operator asks. Paint and quit stay local."""
+
+        workflow = getattr(self.app, "workflow_app", None)
+        if workflow is None:
+            return
+        resume(workflow, self._issue)
+        self._reload()
 
     def action_quit_status(self) -> None:
         self.app.exit()
@@ -139,6 +178,7 @@ class StatusScreen(Screen[None]):
                 sha=snapshot_sha,
                 stored_sha=row.stored_sha,
                 stale=row.snapshot.stale,
+                historical=snapshot_is_historical(row.freshness, snapshot_sha),
                 revise=revise,
             )
         )

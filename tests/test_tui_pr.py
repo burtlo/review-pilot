@@ -1,4 +1,4 @@
-"""P6: headless PR review screen triage."""
+"""P6–P7: headless PR review screen triage."""
 
 from __future__ import annotations
 
@@ -6,14 +6,22 @@ import asyncio
 import json
 from pathlib import Path
 
+from review_ticket.interactive_triage import (
+    accept_finding,
+    confirm_blocker,
+    reject_finding,
+    set_finding_explanation,
+    set_track_disposition,
+)
 from review_ticket.storage import Store, read_json, write_json
 from review_ticket.tui import ReviewTicketApp
 from review_ticket.tui.pr_screen import PrReviewScreen
 from review_ticket.tui.status_screen import StatusScreen
+from textual.containers import Vertical
 from textual.widgets import Button, Markdown, Static, TextArea
 
 PILOT_SIZE = (120, 48)
-from tests.support import ISSUE, SHA1, SHA2, make_app
+from tests.support import DIFF, ISSUE, SHA1, SHA2, make_app
 from tests.test_status_projection import REF_A, REF_B, REF_C, _seed_three_pr_session, _store
 
 SHA_OLD = "d" * 40
@@ -28,6 +36,57 @@ def _pr_slug(ref: str) -> str:
 
 def _commit_dir(tmp_path: Path, ref: str, sha: str) -> Path:
     return tmp_path / "reviews" / ISSUE / "prs" / _pr_slug(ref) / "commits" / sha
+
+
+def _seed_multi_findings(commit_dir: Path) -> None:
+    review = commit_dir / "review"
+    review.mkdir(parents=True, exist_ok=True)
+    write_json(
+        review / "findings.json",
+        {
+            "summary": "Multi-finding review.",
+            "findings": [
+                {
+                    "id": "F001",
+                    "title": "Keep finding",
+                    "must_fix": False,
+                    "path": "src/Keep.cs",
+                    "line": 10,
+                    "side": "RIGHT",
+                    "explanation": "Keep as-is.",
+                },
+                {
+                    "id": "F002",
+                    "title": "Exclude finding",
+                    "must_fix": False,
+                    "path": "src/Drop.cs",
+                    "line": 20,
+                    "side": "RIGHT",
+                    "explanation": "Drop from publish.",
+                },
+                {
+                    "id": "F003",
+                    "title": "Edit finding",
+                    "must_fix": True,
+                    "path": "src/Example.cs",
+                    "line": 142,
+                    "side": "RIGHT",
+                    "explanation": "Original text.",
+                    "suggested_change": "fix",
+                },
+            ],
+        },
+    )
+    write_json(
+        review / "diff-lines.json",
+        [
+            ["src/Keep.cs", 10, "RIGHT"],
+            ["src/Drop.cs", 20, "RIGHT"],
+            ["src/Example.cs", 142, "RIGHT"],
+        ],
+    )
+    (commit_dir / "diff.patch").write_text(DIFF, encoding="utf-8")
+    (review / "reviewer-report.md").write_text(f"# Report\n\n{NARRATIVE_MARKER}\n", encoding="utf-8")
 
 
 def _seed_rich_findings(commit_dir: Path) -> None:
@@ -138,6 +197,8 @@ def test_stale_banner_lists_stored_sha_and_publish_refusal(tmp_path):
             assert SHA2[:12] in text or "Stored SHA" in text
             assert "not the stored commit" in text
             assert "run-review" in text
+            assert app.screen.stale is True
+            assert app.screen.historical is False
 
     asyncio.run(_run())
 
@@ -247,5 +308,123 @@ def test_return_to_status_shows_recorded_progress_after_save(tmp_path):
             doc = app.screen.query_one("#status-doc", Markdown).source
             assert "Human review recorded" in doc
             assert SHA2[:12] in doc
+
+    asyncio.run(_run())
+
+
+def test_scenario_e_exclude_edit_keep_persists_and_omits_from_payload(tmp_path):
+    _seed_three_pr_session(tmp_path)
+    commit = _commit_dir(tmp_path, REF_B, SHA2)
+    _seed_multi_findings(commit)
+    review_dir = commit / "review"
+    actions = tmp_path / "reviews" / ISSUE / "actions.jsonl"
+    app = _make_review_app(tmp_path)
+
+    async def _run() -> None:
+        async with app.run_test(size=PILOT_SIZE) as pilot:
+            await pilot.pause()
+            await _open_pr_row(pilot, 1)
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, PrReviewScreen)
+            assert screen._state is not None
+            reject_finding(screen._state, "F002")
+            set_finding_explanation(screen._state, "F003", "Edited explanation.")
+            accept_finding(screen._state, "F003")
+            accept_finding(screen._state, "F001")
+            screen._save_review()
+            await pilot.pause()
+
+    asyncio.run(_run())
+    human = json.loads((review_dir / "human-review.json").read_text(encoding="utf-8"))
+    assert human["findings"]["F001"]["decision"] == "accept"
+    assert human["findings"]["F002"]["decision"] == "reject"
+    assert human["findings"]["F003"]["decision"] == "accept"
+    assert human["findings"]["F003"]["explanation"] == "Edited explanation."
+    payload = json.loads((review_dir / "proposed-review.json").read_text(encoding="utf-8"))
+    comment_paths = {item["path"] for item in payload.get("comments") or []}
+    assert "src/Drop.cs" not in comment_paths
+    assert not actions.exists()
+
+
+def test_diff_excerpt_renders_from_patch(tmp_path):
+    _seed_three_pr_session(tmp_path)
+    commit = _commit_dir(tmp_path, REF_B, SHA2)
+    _seed_rich_findings(commit)
+    (commit / "diff.patch").write_text(DIFF, encoding="utf-8")
+    app = _make_review_app(tmp_path)
+
+    async def _run() -> None:
+        async with app.run_test(size=PILOT_SIZE) as pilot:
+            await pilot.pause()
+            await _open_pr_row(pilot, 1)
+            await pilot.pause()
+            excerpt = str(app.screen.query_one("#diff-excerpt", Static).render())
+            assert "142" in excerpt
+            assert "Quantity" in excerpt or "item" in excerpt.lower()
+
+    asyncio.run(_run())
+
+
+def test_must_fix_does_not_auto_set_track_disposition(tmp_path):
+    _seed_three_pr_session(tmp_path)
+    _seed_rich_findings(_commit_dir(tmp_path, REF_B, SHA2))
+    app = _make_review_app(tmp_path)
+    review_dir = _commit_dir(tmp_path, REF_B, SHA2) / "review"
+
+    async def _run() -> None:
+        async with app.run_test(size=PILOT_SIZE) as pilot:
+            await pilot.pause()
+            await _open_pr_row(pilot, 1)
+            await pilot.pause()
+            await pilot.click("#btn-accept")
+            await pilot.click("#btn-save")
+            await pilot.pause()
+
+    asyncio.run(_run())
+    human = json.loads((review_dir / "human-review.json").read_text(encoding="utf-8"))
+    assert human.get("disposition") is None
+    assert human.get("blocker_confirmed") is not True
+
+
+def test_request_changes_handoff_requires_blocker_confirmation(tmp_path):
+    _seed_three_pr_session(tmp_path)
+    _seed_rich_findings(_commit_dir(tmp_path, REF_B, SHA2))
+    app = _make_review_app(tmp_path)
+    review_dir = _commit_dir(tmp_path, REF_B, SHA2) / "review"
+
+    async def _run() -> None:
+        async with app.run_test(size=PILOT_SIZE) as pilot:
+            await pilot.pause()
+            await _open_pr_row(pilot, 1)
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, PrReviewScreen)
+            assert screen._state is not None
+            accept_finding(screen._state, "F001")
+            set_track_disposition(screen._state, "REQUEST_CHANGES")
+            confirm_blocker(screen._state)
+            screen._save_review()
+            await pilot.pause()
+
+    asyncio.run(_run())
+    human = json.loads((review_dir / "human-review.json").read_text(encoding="utf-8"))
+    assert human.get("disposition") == "REQUEST_CHANGES"
+    assert human.get("blocker_confirmed") is True
+    assert not (tmp_path / "reviews" / ISSUE / "prs" / _pr_slug(REF_B) / "commits" / SHA2 / "review" / "publication.json").exists()
+
+
+def test_narrow_terminal_stacks_review_body(tmp_path):
+    _seed_three_pr_session(tmp_path)
+    _seed_rich_findings(_commit_dir(tmp_path, REF_B, SHA2))
+    app = _make_review_app(tmp_path)
+
+    async def _run() -> None:
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            await _open_pr_row(pilot, 1)
+            await pilot.pause()
+            body = app.screen.query_one("#review-body", Vertical)
+            assert body.has_class("stacked")
 
     asyncio.run(_run())

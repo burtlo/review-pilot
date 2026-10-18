@@ -39,11 +39,24 @@ class FindingState:
         return self.default_explanation
 
 
+TRACK_DISPOSITIONS = frozenset({"APPROVE", "COMMENT", "REQUEST_CHANGES"})
+
+
+def decision_display_label(decision: str | None) -> str:
+    if decision == "accept":
+        return "include"
+    if decision == "reject":
+        return "exclude"
+    return "undecided"
+
+
 @dataclass
 class TriageState:
     findings: list[FindingState] = field(default_factory=list)
     summary: str = ""
     event: str | None = None
+    disposition: str | None = None
+    blocker_confirmed: bool = False
     rejected_review: bool = False
 
     def all_decided(self) -> bool:
@@ -82,10 +95,16 @@ def _triage_state_from_review_files(
                 explanation=explanation,
             )
         )
+    disposition = existing.get("disposition")
+    if disposition not in TRACK_DISPOSITIONS:
+        disposition = None
+    blocker_confirmed = bool(existing.get("blocker_confirmed")) and disposition == "REQUEST_CHANGES"
     return TriageState(
         findings=rows,
         summary=str(existing.get("summary") or document.get("summary") or ""),
         event=existing.get("event"),
+        disposition=disposition,
+        blocker_confirmed=blocker_confirmed,
         rejected_review=bool(existing.get("rejected_review")),
     )
 
@@ -158,13 +177,18 @@ def human_document_from_state(state: TriageState) -> dict[str, Any]:
         if item.explanation is not None and item.explanation != item.default_explanation:
             entry["explanation"] = item.explanation
         decisions[item.finding_id] = entry
-    return {
+    document: dict[str, Any] = {
         "rejected_review": False,
         "findings": decisions,
         "added": [],
         "event": state.event,
         "summary": state.summary,
     }
+    if state.disposition in TRACK_DISPOSITIONS:
+        document["disposition"] = state.disposition
+    if state.disposition == "REQUEST_CHANGES" and state.blocker_confirmed:
+        document["blocker_confirmed"] = True
+    return document
 
 
 def _format_counts(inline: int, summary_only: int) -> str:
@@ -262,10 +286,29 @@ def set_event(state: TriageState, event: str | None) -> None:
         state.event = None
         return
     text = str(event).strip().upper()
-    if text in {"COMMENT", "APPROVE", "REQUEST_CHANGES"}:
+    if text in TRACK_DISPOSITIONS:
         state.event = text
         return
     raise WorkflowError("event must be COMMENT, APPROVE, or REQUEST_CHANGES.")
+
+
+def set_track_disposition(state: TriageState, disposition: str | None) -> None:
+    if disposition is None or not str(disposition).strip():
+        state.disposition = None
+        state.blocker_confirmed = False
+        return
+    text = str(disposition).strip().upper()
+    if text not in TRACK_DISPOSITIONS:
+        raise WorkflowError("disposition must be APPROVE, COMMENT, or REQUEST_CHANGES.")
+    state.disposition = text
+    if text != "REQUEST_CHANGES":
+        state.blocker_confirmed = False
+
+
+def confirm_blocker(state: TriageState) -> None:
+    if state.disposition != "REQUEST_CHANGES":
+        raise WorkflowError("Confirm a blocker only after choosing Request Changes disposition.")
+    state.blocker_confirmed = True
 
 
 def reject_automated_review(state: TriageState) -> None:

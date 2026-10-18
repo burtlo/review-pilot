@@ -269,6 +269,9 @@ def _test(app: App, issue: str, args: argparse.Namespace) -> StepResult:
     if args.test_cmd == "plan":
         return write_test_plan_command(app, issue)
     if args.test_cmd == "record":
+        disposition = None
+        if args.disposition:
+            disposition = args.disposition.replace("-", "_").upper()
         return record_tests(
             app,
             issue,
@@ -278,6 +281,11 @@ def _test(app: App, issue: str, args: argparse.Namespace) -> StepResult:
             scenarios=args.scenario or [],
             evidence=args.evidence or [],
             revise=args.revise,
+            steps=args.steps or "",
+            observed=args.observed or "",
+            expected=args.expected or "",
+            plan_reference=args.plan_reference or "",
+            disposition=disposition,
         )
     return post_comment(
         app,
@@ -410,6 +418,11 @@ def build_parser() -> argparse.ArgumentParser:
     recorded.add_argument("--scenario", action="append", default=[])
     recorded.add_argument("--evidence", action="append", default=[])
     recorded.add_argument("--revise", action="store_true")
+    recorded.add_argument("--steps", default="")
+    recorded.add_argument("--observed", default="")
+    recorded.add_argument("--expected", default="")
+    recorded.add_argument("--plan-reference", default="")
+    recorded.add_argument("--disposition", choices=["approve", "comment", "request-changes"])
     test_comment = test_sub.add_parser("comment")
     _add_comment_flags(test_comment)
 

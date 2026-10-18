@@ -1,4 +1,9 @@
-"""Jira testing-notes review screen with reject draft save and accept."""
+"""Jira testing-notes review on the shared decision panel.
+
+Approve stores acceptance and opens the PR readiness screen. Reject keeps
+the notes visible, saves a local draft, then asks separately before posting
+a comment or moving the ticket.
+"""
 
 from __future__ import annotations
 
@@ -6,20 +11,39 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from textual.app import ComposeResult
-from textual.containers import HorizontalGroup, Vertical, VerticalGroup, VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Button, Footer, Header, Link, Markdown, Static, TextArea
+from textual.widgets import Button, Footer, Header, Link, Markdown, Static
 
-from review_ticket.models import Outcome
+from review_ticket.models import AuthorizationDenied, Outcome, WorkflowError
 from review_ticket.reports import return_comment, testing_notes_assessment_markdown
 from review_ticket.storage import read_json
-from review_ticket.textutil import format_jira_body_markdown, issue_section_markdown
+from review_ticket.textutil import issue_section_markdown
+from review_ticket.tui.readiness_screen import ReadinessScreen
+from review_ticket.tui.shared_chrome import (
+    ApproveRequested,
+    CommentAuthorized,
+    CommentDeclined,
+    ContextHeader,
+    DecisionPanel,
+    DraftSaved,
+    Emphasis,
+    PanelDismissed,
+    PanelPhase,
+    RejectStarted,
+    ReviewContext,
+    TransitionAuthorized,
+    TransitionDeclined,
+)
 from review_ticket.util import fingerprint, sha256_text
 from review_ticket.workflow import decide_notes, get_decision, jira_comment, jira_transition, refresh_issue
 
 if TYPE_CHECKING:
     from review_ticket.storage import Store
     from review_ticket.workflow import App as WorkflowApp
+
+COMMENT_DECLINED = "comment-declined"
+TRANSITION_DECLINED = "transition-declined"
 
 
 def should_auto_present_testing_notes(session: dict[str, Any]) -> bool:
@@ -32,7 +56,9 @@ def should_auto_present_testing_notes(session: dict[str, Any]) -> bool:
 
 
 class TestingNotesScreen(Screen[None]):
-    """Refresh Jira issue fields; record testing-notes accept/reject decisions."""
+    """Refresh Jira issue fields and record the testing-notes decision."""
+
+    __test__ = False
 
     BINDINGS = [
         ("escape", "go_back", "Back"),
@@ -40,7 +66,6 @@ class TestingNotesScreen(Screen[None]):
     ]
 
     CSS = """
-    /* https://textual.textualize.io/how-to/design-a-layout/ — dock chrome, 1fr body */
     TestingNotesScreen {
         layout: vertical;
         overflow: hidden;
@@ -51,6 +76,16 @@ class TestingNotesScreen(Screen[None]):
     }
     TestingNotesScreen Footer {
         dock: bottom;
+        height: auto;
+    }
+    /* Header and Footer already occupy the edges. Undock the shared chrome
+       so it stacks in the body instead of painting on top of them. */
+    TestingNotesScreen ContextHeader {
+        dock: none;
+        height: auto;
+    }
+    TestingNotesScreen DecisionPanel {
+        dock: none;
         height: auto;
     }
     TestingNotesScreen #screen-fill {
@@ -66,20 +101,27 @@ class TestingNotesScreen(Screen[None]):
     }
     TestingNotesScreen #ticket-panels {
         height: 1fr;
-        min-height: 18;
+        min-height: 0;
         layout: vertical;
         overflow: hidden;
     }
+    TestingNotesScreen #description-collapsed {
+        height: auto;
+        margin: 0 1;
+        text-style: bold;
+        display: none;
+    }
+    /* 2fr + 3fr gives the notes about 60% of the evidence height. */
     TestingNotesScreen #description-scroll {
-        height: 1fr;
-        min-height: 8;
+        height: 2fr;
+        min-height: 4;
         margin: 0 1;
         border: tall $panel;
         background: $surface;
     }
     TestingNotesScreen #assessment-scroll {
-        height: 1fr;
-        min-height: 8;
+        height: 3fr;
+        min-height: 6;
         margin: 0 1 1 1;
         border: tall $panel;
         background: $surface;
@@ -89,24 +131,6 @@ class TestingNotesScreen(Screen[None]):
         margin: 0 1 0 1;
         text-style: bold;
         color: $text;
-    }
-    TestingNotesScreen #workflow-dock {
-        width: 1fr;
-        height: auto;
-        background: $background;
-        border-top: tall $primary-darken-2;
-        padding: 0 1 1 1;
-    }
-    /* Horizontal defaults to height: 1fr and would stretch this dock into the
-       spare rows, leaving a blank band under the buttons. */
-    TestingNotesScreen #workflow-dock HorizontalGroup {
-        width: 1fr;
-        height: auto;
-    }
-    TestingNotesScreen #return-draft {
-        height: auto;
-        min-height: 6;
-        max-height: 12;
     }
     TestingNotesScreen .issue-body-md {
         width: 1fr;
@@ -125,14 +149,34 @@ class TestingNotesScreen(Screen[None]):
         self._workflow_app = workflow_app
         self._issue_data: dict[str, Any] = {}
 
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer(show_command_palette=False)
+        with Vertical(id="screen-fill"):
+            yield ContextHeader(
+                ReviewContext(issue_key=self._issue, title="", stage="Testing notes")
+            )
+            yield Link(self._issue, id="issue-link")
+            with Vertical(id="ticket-panels"):
+                yield Static("Issue description", id="description-collapsed")
+                with VerticalScroll(id="description-scroll"):
+                    yield Markdown("", id="description-md", classes="issue-body-md")
+                yield Static("Testing notes assessment", id="assessment-heading")
+                with VerticalScroll(id="assessment-scroll"):
+                    yield Markdown("", id="assessment-md", classes="issue-body-md")
+            yield DecisionPanel(
+                issue_key=self._issue,
+                target_status=self._workflow_app.config.in_progress_status,
+                current_status="",
+                prefill="",
+                prompt="Are the testing notes adequate?",
+            )
+
     def on_mount(self) -> None:
-        self.query_one("#reject-panel", VerticalGroup).display = False
-        self.query_one("#post-panel", VerticalGroup).display = False
-        self.query_one("#transition-panel", VerticalGroup).display = False
         session = read_json(self._store.issue_dir(self._issue) / "session.json") or {}
         self._issue_data = refresh_issue(self._workflow_app, session)
-        url = str(self._issue_data.get("url") or "")
         summary = str(self._issue_data.get("summary") or self._issue)
+        url = str(self._issue_data.get("url") or "")
         link = self.query_one("#issue-link", Link)
         if url:
             link.url = url
@@ -144,78 +188,138 @@ class TestingNotesScreen(Screen[None]):
         self.query_one("#assessment-md", Markdown).update(
             testing_notes_assessment_markdown(self._issue_data)
         )
-        decision = get_decision(session, "testing_notes")
-        revise = bool(getattr(self.app, "revise", False))
-        if decision is not None and not revise:
-            self._set_decision_buttons_enabled(False)
-            if decision.get("choice") == "reject":
-                self._show_reject_panel(prefill=self._read_return_draft(), focus=False)
-                self._sync_authorize_panels()
-        elif decision is not None and revise:
-            self._set_decision_buttons_enabled(True)
-        self.query_one("#description-scroll", VerticalScroll).focus()
+        emphasis = self._emphasis()
+        recommendation = "Approve" if emphasis == Emphasis.APPROVE else "Reject"
+        outcome = session.get("outcome")
+        self.query_one(ContextHeader).update_context(
+            ReviewContext(
+                issue_key=self._issue,
+                title=summary,
+                stage="Testing notes",
+                outcome=str(outcome) if outcome else None,
+                recommendation=recommendation,
+            )
+        )
+        panel = self.query_one(DecisionPanel)
+        panel.state.current_status = str(self._issue_data.get("status") or "")
+        panel.state.default_prefill = self._draft_prefill()
+        panel.set_emphasis(emphasis)
 
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield Footer(show_command_palette=False)
-        with Vertical(id="screen-fill"):
-            yield Link(self._issue, id="issue-link")
-            with Vertical(id="ticket-panels"):
-                with VerticalScroll(id="description-scroll"):
-                    yield Markdown("", id="description-md", classes="issue-body-md")
-                yield Static("Testing notes assessment", id="assessment-heading")
-                with VerticalScroll(id="assessment-scroll"):
-                    yield Markdown("", id="assessment-md", classes="issue-body-md")
-            with VerticalGroup(id="workflow-dock"):
-                with HorizontalGroup(id="decision-row"):
-                    yield Button("Accept", id="accept-btn", variant="success")
-                    yield Button("Reject", id="reject-btn", variant="error")
-                with VerticalGroup(id="reject-panel", classes="reject-panel"):
-                    yield TextArea("", id="return-draft")
-                    yield Button("Save", id="save-btn", variant="primary")
-                with VerticalGroup(id="post-panel"):
-                    yield Markdown("", id="post-preview-md")
-                    with HorizontalGroup(id="post-actions"):
-                        yield Button("Approve", id="post-approve-btn", variant="success")
-                        yield Button("Deny", id="post-deny-btn")
-                with VerticalGroup(id="transition-panel"):
-                    yield Markdown("", id="transition-preview-md")
-                    with HorizontalGroup(id="transition-actions"):
-                        yield Button("Approve", id="transition-approve-btn", variant="success")
-                        yield Button("Deny", id="transition-deny-btn")
+        decision = get_decision(session, "testing_notes")
+        revise = self._revise()
+        if decision is not None and decision.get("choice") == "reject" and not revise:
+            status = self._in_progress_status()
+            if self._transition_done(status):
+                self._back_to_status()
+                return
+            draft = self._read_return_draft()
+            self._collapse_description()
+            panel.restore_rejection(draft, comment_posted=self._comment_posted(draft))
+        else:
+            self._expand_description()
+        self._apply_gate()
+        self._focus_open_decision()
 
     def action_focus_issue_link(self) -> None:
         self.query_one("#issue-link", Link).focus()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "accept-btn":
-            self._on_accept()
-        elif event.button.id == "reject-btn":
-            self._show_reject_panel(prefill=self._draft_prefill(), focus=True)
-        elif event.button.id == "save-btn":
-            self._on_save_reject()
-        elif event.button.id == "post-approve-btn":
-            self._on_post_approve()
-        elif event.button.id == "post-deny-btn":
-            self._on_post_deny()
-        elif event.button.id == "transition-approve-btn":
-            self._on_transition_approve()
-        elif event.button.id == "transition-deny-btn":
-            self._on_transition_deny()
+    def action_go_back(self) -> None:
+        self._back_to_status()
+
+    def on_approve_requested(self, message: ApproveRequested) -> None:
+        message.stop()
+        if self.query_one("#approve-btn", Button).disabled:
+            return
+        decide_notes(self._workflow_app, self._issue, "accept", "", revise=self._revise())
+        self.app.switch_screen(ReadinessScreen(self._store, self._issue, self._workflow_app))
+
+    def on_reject_started(self, message: RejectStarted) -> None:
+        message.stop()
+        self._collapse_description()
+
+    def on_draft_saved(self, message: DraftSaved) -> None:
+        message.stop()
+        decide_notes(
+            self._workflow_app,
+            self._issue,
+            "reject",
+            "",
+            revise=self._revise(),
+            draft_body=message.text,
+        )
+        self._collapse_description()
+        self._apply_gate(lock_decision=True)
+
+    def on_comment_authorized(self, message: CommentAuthorized) -> None:
+        message.stop()
+        panel = self.query_one(DecisionPanel)
+        path = self._return_draft_path()
+        if not path.exists():
+            panel.record_comment_failure("The saved draft is missing.")
+            return
+        try:
+            result = jira_comment(
+                self._workflow_app,
+                self._issue,
+                body_file=path,
+                body=None,
+                yes=True,
+            )
+        except (WorkflowError, AuthorizationDenied) as exc:
+            panel.record_comment_failure(str(exc))
+            return
+        if result.outcome == Outcome.BLOCKED:
+            panel.record_comment_failure(result.summary)
+            return
+        self._clear_flag(COMMENT_DECLINED)
+        panel.record_comment_success()
+
+    def on_comment_declined(self, message: CommentDeclined) -> None:
+        message.stop()
+        self._set_flag(COMMENT_DECLINED)
+
+    def on_transition_authorized(self, message: TransitionAuthorized) -> None:
+        message.stop()
+        panel = self.query_one(DecisionPanel)
+        try:
+            result = jira_transition(self._workflow_app, self._issue, message.status, yes=True)
+        except (WorkflowError, AuthorizationDenied) as exc:
+            panel.record_transition_failure(str(exc))
+            return
+        if result.outcome == Outcome.BLOCKED:
+            panel.record_transition_failure(result.summary)
+            return
+        self._clear_flag(TRANSITION_DECLINED)
+        panel.record_transition_success()
+
+    def on_transition_declined(self, message: TransitionDeclined) -> None:
+        message.stop()
+        self._set_flag(TRANSITION_DECLINED)
+
+    def on_panel_dismissed(self, message: PanelDismissed) -> None:
+        message.stop()
+        self._back_to_status()
 
     def _revise(self) -> bool:
         return bool(getattr(self.app, "revise", False))
 
+    def _notes_text(self) -> str:
+        return (self._issue_data.get("testing_notes") or "").strip()
+
+    def _emphasis(self) -> Emphasis:
+        return Emphasis.APPROVE if self._notes_text() else Emphasis.REJECT
+
     def _draft_prefill(self) -> str:
         path = self._return_draft_path()
         if path.exists():
-            return path.read_text(encoding="utf-8")
-        return return_comment(
-            issue=self._issue,
-            reason="No testing notes were found on the Jira issue.",
-            notes="",
-            links=[],
-        )
+            saved = path.read_text(encoding="utf-8")
+            if saved.strip():
+                return saved
+        if self._notes_text():
+            reason = "The testing notes are missing or not adequate for peer review."
+        else:
+            reason = "No testing notes were found on the Jira issue."
+        return return_comment(issue=self._issue, reason=reason, notes="", links=[])
 
     def _return_draft_path(self) -> Path:
         return self._store.issue_dir(self._issue) / "return-comment.md"
@@ -223,42 +327,66 @@ class TestingNotesScreen(Screen[None]):
     def _read_return_draft(self) -> str:
         path = self._return_draft_path()
         if path.exists():
-            return path.read_text(encoding="utf-8")
+            text = path.read_text(encoding="utf-8")
+            if text.strip():
+                return text
         return self._draft_prefill()
 
-    def _set_ticket_panels_visible(self, visible: bool) -> None:
-        self.query_one("#ticket-panels", Vertical).display = visible
+    def _expand_description(self) -> None:
+        self.query_one("#description-scroll").display = True
+        self.query_one("#description-collapsed").display = False
 
-    def _show_reject_panel(self, *, prefill: str, focus: bool) -> None:
-        self._set_ticket_panels_visible(not focus)
-        panel = self.query_one("#reject-panel", VerticalGroup)
-        panel.display = True
-        draft = self.query_one("#return-draft", TextArea)
-        draft.disabled = False
-        draft.text = prefill
-        if focus:
-            draft.focus()
+    def _collapse_description(self) -> None:
+        self.query_one("#description-scroll").display = False
+        self.query_one("#description-collapsed").display = True
 
-    def _set_decision_buttons_enabled(self, enabled: bool) -> None:
-        self.query_one("#accept-btn", Button).disabled = not enabled
-        self.query_one("#reject-btn", Button).disabled = not enabled
+    def _apply_gate(self, *, lock_decision: bool | None = None) -> None:
+        """Disable Approve when testing notes are empty.
 
-    def _on_save_reject(self) -> None:
-        body = self.query_one("#return-draft", TextArea).text
-        decide_notes(
-            self._workflow_app,
-            self._issue,
-            "reject",
-            "",
-            revise=self._revise(),
-            draft_body=body,
-        )
-        self._set_decision_buttons_enabled(False)
-        self.query_one("#return-draft", TextArea).disabled = True
-        self._show_post_panel()
+        ``step_jira`` never offers accept for an empty notes body. A saved
+        decision stays locked until ``--revise``.
+        """
+
+        decision = get_decision(self._session(), "testing_notes")
+        if lock_decision is None:
+            lock_decision = decision is not None and not self._revise()
+        notes_present = bool(self._notes_text())
+        self.query_one("#reject-btn", Button).disabled = lock_decision
+        self.query_one("#approve-btn", Button).disabled = lock_decision or not notes_present
+
+    def _focus_open_decision(self) -> None:
+        panel = self.query_one(DecisionPanel)
+        if panel.state.phase != PanelPhase.DECISION:
+            return
+        approve = panel.query_one("#approve-btn", Button)
+        reject = panel.query_one("#reject-btn", Button)
+        if panel.state.emphasis == Emphasis.REJECT or approve.disabled:
+            reject.focus()
+        else:
+            approve.focus()
+
+    def _back_to_status(self) -> None:
+        if self.app.screen is self:
+            self.app.pop_screen()
 
     def _session(self) -> dict[str, Any]:
         return read_json(self._store.issue_dir(self._issue) / "session.json") or {}
+
+    def _set_flag(self, flag: str) -> None:
+        session = self._session()
+        decision = get_decision(session, "testing_notes")
+        if decision is None:
+            return
+        decision[flag] = True
+        self._store.save_session(session)
+
+    def _clear_flag(self, flag: str) -> None:
+        session = self._session()
+        decision = get_decision(session, "testing_notes")
+        if decision is None or flag not in decision:
+            return
+        decision.pop(flag, None)
+        self._store.save_session(session)
 
     def _comment_action_key(self, text: str) -> str:
         session = self._session()
@@ -278,83 +406,5 @@ class TestingNotesScreen(Screen[None]):
     def _transition_done(self, status: str) -> bool:
         return self._store.successful_action(self._issue, self._transition_action_key(status)) is not None
 
-    def _comment_preview(self, text: str) -> str:
-        body = format_jira_body_markdown(text).strip() or text.rstrip()
-        return f"Comment on {self._issue}.\n\n{body}\n"
-
-    def _transition_preview(self, status: str) -> str:
-        session = self._session()
-        sha = session.get("active_sha") or ""
-        preview = f"Transition {self._issue} to {status}."
-        if sha:
-            preview += f"\nReview SHA: {sha}"
-        return preview + "\n"
-
     def _in_progress_status(self) -> str:
         return self._workflow_app.config.in_progress_status
-
-    def _sync_authorize_panels(self) -> None:
-        text = self._read_return_draft()
-        status = self._in_progress_status()
-        if self._transition_done(status):
-            self.app.pop_screen()
-            return
-        if self._comment_posted(text):
-            self._show_transition_panel()
-        else:
-            self._show_post_panel()
-
-    def _show_post_panel(self) -> None:
-        text = self._read_return_draft()
-        self._set_ticket_panels_visible(False)
-        self.query_one("#post-preview-md", Markdown).update(self._comment_preview(text))
-        self.query_one("#post-panel", VerticalGroup).display = True
-        self.query_one("#transition-panel", VerticalGroup).display = False
-
-    def _show_transition_panel(self) -> None:
-        status = self._in_progress_status()
-        self._set_ticket_panels_visible(False)
-        self.query_one("#transition-preview-md", Markdown).update(self._transition_preview(status))
-        self.query_one("#post-panel", VerticalGroup).display = False
-        self.query_one("#transition-panel", VerticalGroup).display = True
-
-    def _on_post_approve(self) -> None:
-        body_file = self._return_draft_path()
-        if not body_file.exists():
-            return
-        result = jira_comment(
-            self._workflow_app,
-            self._issue,
-            body_file=body_file,
-            body=None,
-            yes=True,
-        )
-        if result.outcome == Outcome.BLOCKED:
-            preview = self._comment_preview(body_file.read_text(encoding="utf-8"))
-            self.query_one("#post-preview-md", Markdown).update(f"{preview}\n**Blocked:** {result.summary}")
-            return
-        self._show_transition_panel()
-
-    def _on_post_deny(self) -> None:
-        self.query_one("#post-panel", VerticalGroup).display = False
-        draft = self.query_one("#return-draft", TextArea)
-        draft.disabled = False
-
-    def _on_transition_approve(self) -> None:
-        status = self._in_progress_status()
-        result = jira_transition(self._workflow_app, self._issue, status, yes=True)
-        if result.outcome == Outcome.BLOCKED:
-            preview = self._transition_preview(status)
-            self.query_one("#transition-preview-md", Markdown).update(f"{preview}\n**Blocked:** {result.summary}")
-            return
-        self.app.pop_screen()
-
-    def _on_transition_deny(self) -> None:
-        return
-
-    def _on_accept(self) -> None:
-        decide_notes(self._workflow_app, self._issue, "accept", "", revise=self._revise())
-        self.app.pop_screen()
-
-    def action_go_back(self) -> None:
-        self.app.pop_screen()

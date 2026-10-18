@@ -150,6 +150,7 @@ class World:
         self.issue = jira_document(notes=None)
         self.comments: list = []
         self.head_sha = SHA1
+        self.head_by_repo: dict[str, str] = {}
         self.required_checks = passing_checks()
         self.all_checks = passing_checks()
         self.threads = review_threads()
@@ -165,6 +166,11 @@ class World:
             "approval_recommendation": "request_changes",
             "findings": [],
         }
+        self.review_post_code = 0
+        self.docker_pull_code = 0
+        self.docker_pull_stderr = "pull failed"
+        self.docker_compose_code = 0
+        self.docker_compose_stderr = "compose failed"
 
     def handle(self, argv: list[str], cwd: str | None, data: str | None, env: dict | None) -> CommandResult:
         joined = " ".join(argv)
@@ -186,7 +192,7 @@ class World:
             payload = self.required_checks if "--required" in argv else self.all_checks
             return CommandResult(argv, self._check_code(payload), json.dumps(payload), "")
         if argv[0] == "gh" and "view" in argv:
-            return self._ok(argv, pr_document(self.head_sha))
+            return self._ok(argv, self._pr_view_document(argv))
         if argv[0] == "gh" and "clone" in argv:
             return self._ok(argv, "")
         if argv[0] == "gh" and "comment" in argv and "--body-file" in argv:
@@ -198,6 +204,8 @@ class World:
                 return CommandResult(argv, self.alerts_code, "", self.alerts_stderr or "HTTP 403")
             return self._ok(argv, self.alerts)
         if "--method" in argv and "POST" in argv and "/reviews" in joined:
+            if self.review_post_code:
+                return CommandResult(argv, self.review_post_code, "", "review failed")
             return self._ok(
                 argv,
                 {
@@ -218,12 +226,16 @@ class World:
         if argv[0] == "git":
             return self._ok(argv, "")
         if argv[0] == "docker" and "pull" in argv:
+            if self.docker_pull_code:
+                return CommandResult(argv, self.docker_pull_code, "", self.docker_pull_stderr)
             return self._ok(argv, "pulled\n")
         if argv[0] == "docker" and "inspect" in argv:
             return self._ok(argv, [f"ghcr.io/acme/widgets@{self.digest}"])
         if argv[0] == "docker" and "compose" in argv:
             if "down" in argv:
                 raise AssertionError("virtualization must not destroy environments with compose down")
+            if self.docker_compose_code:
+                return CommandResult(argv, self.docker_compose_code, "", self.docker_compose_stderr)
             return self._ok(argv, "")
         if argv[0] == "reviewer":
             output_path = next(
@@ -243,6 +255,26 @@ class World:
                 completed.stderr or "",
             )
         raise AssertionError(f"unexpected command: {joined}")
+
+    def _head_for_repo(self, argv: list[str]) -> str:
+        if "--repo" in argv:
+            repo = argv[argv.index("--repo") + 1]
+            if repo in self.head_by_repo:
+                return self.head_by_repo[repo]
+        return self.head_sha
+
+    def _pr_view_document(self, argv: list[str]) -> dict:
+        document = dict(pr_document(self._head_for_repo(argv)))
+        if "view" not in argv:
+            return document
+        number_text = argv[argv.index("view") + 1]
+        if not number_text.isdigit():
+            return document
+        document["number"] = int(number_text)
+        if "--repo" in argv:
+            repo = argv[argv.index("--repo") + 1]
+            document["url"] = f"https://github.com/{repo}/pull/{number_text}"
+        return document
 
     def _check_code(self, checks: list[dict]) -> int:
         buckets = [item.get("bucket") for item in checks]

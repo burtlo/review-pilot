@@ -7,7 +7,9 @@ import time
 from pathlib import Path
 
 from review_ticket.storage import Store, write_json
+from review_ticket.policy import TRACK_COMPLETE_LOCALLY, TRACK_PUBLICATION_PENDING
 from review_ticket.status_projection import project_review_status
+from review_ticket.tui.status_format import format_status_document
 from tests.support import ISSUE, SHA1, SHA2
 
 SHA3 = "c" * 40
@@ -79,8 +81,10 @@ def _seed_three_pr_session(tmp_path: Path) -> None:
             "last_completed_step": "analyzer-findings",
             "outcome": "REVIEW_DECISION",
             "next_command": f"review-ticket {ISSUE} attach",
+            "last_updated": "2026-10-18T12:00:00Z",
         },
     )
+    write_json(root / "issue.json", {"key": ISSUE, "summary": "Fix timezone handling"})
     for ref, sha, url in (
         (REF_A, SHA1, "https://github.com/acme/widgets/pull/87"),
         (REF_B, SHA2, "https://github.com/acme/gadgets/pull/12"),
@@ -97,7 +101,24 @@ def _seed_three_pr_session(tmp_path: Path) -> None:
         _seed_checks(commit)
         if ref == REF_A:
             _seed_findings(commit)
-            write_json(commit / "review" / "human-review.json", {"rejected_review": False, "findings": {}})
+            write_json(
+                commit / "review" / "human-review.json",
+                {
+                    "rejected_review": False,
+                    "findings": {},
+                    "recorded_at": "2026-10-18T11:00:00Z",
+                },
+            )
+            write_json(
+                commit / "review" / "manual-review.json",
+                {
+                    "sha": sha,
+                    "completed": True,
+                    "disposition": "APPROVE",
+                    "recorded_at": "2026-10-18T11:30:00Z",
+                },
+            )
+            write_json(commit / "snapshot.json", {"sha": sha, "captured_at": "2026-10-18T10:00:00Z"})
         if ref == REF_B:
             _seed_findings(commit)
 
@@ -137,6 +158,21 @@ def test_three_pr_fixture_projects_rows_checks_and_progress(tmp_path):
 
     assert by_ref[REF_C].progress.kind == "no_snapshot"
     assert len(by_ref[REF_C].checks.rows) == 1
+
+    assert projection.issue_title == "Fix timezone handling"
+    assert projection.session_last_updated == "2026-10-18T12:00:00Z"
+    tracks_a = dict(by_ref[REF_A].tracks)
+    assert tracks_a["automated"] == TRACK_COMPLETE_LOCALLY
+    assert tracks_a["manual"] == TRACK_COMPLETE_LOCALLY
+    assert tracks_a["publication"] == TRACK_PUBLICATION_PENDING
+    assert by_ref[REF_A].publication is None
+    assert by_ref[REF_A].timestamps.captured_at == "2026-10-18T10:00:00Z"
+    assert by_ref[REF_A].timestamps.curated_at == "2026-10-18T11:00:00Z"
+    assert by_ref[REF_A].timestamps.manual_recorded_at == "2026-10-18T11:30:00Z"
+
+    document = format_status_document(projection)
+    assert "Published (Approve)" not in document
+    assert "Publication pending" in document
 
 
 def test_missing_github_checks_yields_empty_check_rows(tmp_path):

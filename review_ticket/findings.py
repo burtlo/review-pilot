@@ -237,3 +237,100 @@ def apply_human_decisions(
         item["source"] = "human"
         merged.append(item)
     return merged
+
+
+def normalize_inline_comment_body(body: str) -> str:
+    """Collapse whitespace for duplicate inline comment detection (spec §10.1)."""
+    return " ".join(str(body or "").split())
+
+
+def _automated_inline_body(finding: dict[str, Any]) -> str:
+    return normalize_inline_comment_body(str(finding.get("explanation") or finding.get("body") or ""))
+
+
+def manual_finding_duplicates_automated(
+    manual: dict[str, Any],
+    selected_automated: list[dict[str, Any]],
+) -> bool:
+    path = manual.get("path")
+    line = manual.get("line")
+    if not path or not isinstance(line, int):
+        return False
+    body = normalize_inline_comment_body(str(manual.get("text") or ""))
+    if not body:
+        return False
+    for finding in selected_automated:
+        if finding.get("decision") == "reject":
+            continue
+        if finding.get("path") != path or finding.get("line") != line:
+            continue
+        if _automated_inline_body(finding) == body:
+            return True
+    return False
+
+
+def manual_findings_for_publication(
+    manual_findings: list[dict[str, Any]],
+    *,
+    selected_automated: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Manual inline findings to include in a publication preview (duplicates removed)."""
+    rows: list[dict[str, Any]] = []
+    for item in manual_findings:
+        if not isinstance(item, dict):
+            continue
+        if manual_finding_duplicates_automated(item, selected_automated):
+            continue
+        rows.append(item)
+    return rows
+
+
+def manual_finding_as_review_row(row: dict[str, Any], *, index: int) -> dict[str, Any]:
+    """Shape a manual finding like an automated row for build_review_payload."""
+    return {
+        "id": str(row.get("finding_id") or f"M{index:03d}"),
+        "title": "Manual finding",
+        "explanation": str(row.get("text") or "").strip(),
+        "must_fix": bool(row.get("blocking")),
+        "path": row.get("path"),
+        "line": row.get("line"),
+        "side": "RIGHT",
+        "priority": "medium",
+        "decision": "accept",
+        "source": "manual",
+    }
+
+
+def assemble_publication_findings(
+    document: dict[str, Any],
+    human: dict[str, Any],
+    manual_review: dict[str, Any] | None,
+    *,
+    selection: dict[str, bool] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Selected and omitted findings for GitHub publication (automated + manual)."""
+    if human.get("rejected_review"):
+        automated: list[dict[str, Any]] = []
+    else:
+        automated = apply_human_decisions(document.get("findings") or [], human)
+    accepted_auto = [item for item in automated if item.get("decision") != "reject"]
+    manual_rows = manual_findings_for_publication(
+        list((manual_review or {}).get("findings") or []),
+        selected_automated=accepted_auto,
+    )
+    manual_as_findings = [
+        manual_finding_as_review_row(row, index=index) for index, row in enumerate(manual_rows, start=1)
+    ]
+    candidates = automated + manual_as_findings
+    selected: list[dict[str, Any]] = []
+    omitted: list[dict[str, Any]] = []
+    for finding in candidates:
+        fid = str(finding.get("id") or "")
+        if finding.get("decision") == "reject":
+            omitted.append({**finding, "_omit_reason": "excluded during automated triage"})
+            continue
+        if selection is not None and fid and not selection.get(fid, True):
+            omitted.append({**finding, "_omit_reason": "not selected for publication"})
+            continue
+        selected.append(finding)
+    return selected, omitted

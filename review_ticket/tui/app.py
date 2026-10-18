@@ -11,7 +11,7 @@ from review_ticket.workflow import App as WorkflowApp
 
 
 class ReviewTicketApp(App[None]):
-    """Root Textual app; attach wiring lands in P7."""
+    """Root Textual app for review-ticket attach."""
 
     TITLE = "review-ticket"
     ENABLE_COMMAND_PALETTE = False

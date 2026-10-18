@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Sequence
 
 from review_ticket.textutil import format_jira_body_markdown
 
@@ -462,6 +463,94 @@ def return_comment(*, issue: str, reason: str, notes: str, links: list[str] | No
     )
 
 
+@dataclass(frozen=True)
+class ReadinessAttention:
+    """One pull request the readiness return draft may name.
+
+    ``findings`` may include resolved threads. The draft keeps only
+    ``attention == "unaddressed"``. ``problems`` are failed, missing, or
+    otherwise blocking check lines. Do not pass successful checks.
+    """
+
+    number: int
+    sha: str
+    findings: tuple[dict[str, Any], ...] = ()
+    problems: tuple[str, ...] = ()
+
+
+def _unaddressed_finding_line(finding: dict[str, Any]) -> str:
+    source = str(finding.get("source") or "analyzer")
+    label = source[:1].upper() + source[1:] if source else "Analyzer"
+    where = str(finding.get("path") or "unknown file")
+    line_no = finding.get("line")
+    if isinstance(line_no, int):
+        where = f"{where}:{line_no}"
+    body = " ".join(str(finding.get("body") or "").split())
+    text = f"{label} identified a finding in {where}."
+    if body:
+        text = f"{text} {body}"
+    return text
+
+
+@dataclass(frozen=True)
+class TicketReturnAttention:
+    """One pull request named in a hub ticket return draft."""
+
+    number: int
+    sha: str
+    code_lines: tuple[str, ...] = ()
+    functional_lines: tuple[str, ...] = ()
+    github_line: str | None = None
+
+
+def ticket_disposition_return_draft(*, issue: str, attention: Sequence[TicketReturnAttention]) -> str:
+    """Editable Jira return text for ticket disposition — blocking PRs only."""
+
+    lines = [f"Returning {issue} to In Progress.", ""]
+    for item in attention:
+        if not item.code_lines and not item.functional_lines and not item.github_line:
+            continue
+        lines.append(f"PR #{item.number} — SHA {item.sha}")
+        if item.code_lines:
+            lines.append("Code review:")
+            for row in item.code_lines:
+                lines.append(f"- {row}")
+        if item.functional_lines:
+            lines.append("Functional testing:")
+            for row in item.functional_lines:
+                lines.append(f"- {row}")
+        if item.github_line:
+            lines.append(f"- {item.github_line}")
+        lines.append("")
+    lines.append("Please address the blocking issues before returning the ticket to Peer Review.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def readiness_return_draft(*, issue: str, attention: Sequence[ReadinessAttention]) -> str:
+    """Return comment that names only pull requests and findings that need attention.
+
+    Omits ready pull requests, resolved threads, and successful checks.
+    This is the TUI reject prefill. The CLI ``analyzers --return`` text stays
+    :func:`return_comment` over every stored finding.
+    """
+
+    lines = [f"Requesting that {issue} return to In Progress.", ""]
+    for item in attention:
+        findings = [finding for finding in item.findings if finding.get("attention") == "unaddressed"]
+        problems = [problem.strip() for problem in item.problems if problem and problem.strip()]
+        if not findings and not problems:
+            continue
+        lines.append(f"PR #{item.number} — SHA {item.sha}")
+        for problem in problems:
+            lines.append(f"- {problem}")
+        for finding in findings:
+            lines.append(f"- {_unaddressed_finding_line(finding)}")
+        lines.append("- Please address the finding or explain why it does not apply.")
+        lines.append("")
+    lines.append("The ticket can be reviewed again after the blocking findings are resolved.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def test_plan(
     *,
     issue: dict[str, Any],
@@ -504,12 +593,32 @@ def test_results_markdown(result: dict[str, Any]) -> str:
     evidence_lines = [f"- `{item}`" for item in evidence] or ["- None."]
     scenarios = result.get("scenarios") or []
     scenario_lines = [f"- {item}" for item in scenarios] or ["- None recorded."]
+    disposition = result.get("disposition") or "n/a"
+    tested_at = result.get("tested_at") or result.get("recorded_at") or "n/a"
     return f"""# Test results `{result.get('sha')}`
 
 Result: **{result.get('result')}**
 Failure kind: {result.get('failure_kind') or 'n/a'}
+Disposition: **{disposition}**
+Tested at: {tested_at}
 Image: `{result.get('image') or ''}`
 Digest: `{result.get('digest') or ''}`
+
+## Plan reference
+
+{result.get('plan_reference') or '_None._'}
+
+## Steps
+
+{result.get('steps') or '_None._'}
+
+## Observed
+
+{result.get('observed') or '_None._'}
+
+## Expected
+
+{result.get('expected') or '_None._'}
 
 ## Scenarios
 
@@ -531,10 +640,18 @@ def functional_comment(result: dict[str, Any], *, pr_url: str = "") -> str:
         "",
         f"Result: **{result.get('result')}**",
     ]
+    if result.get("disposition"):
+        lines.append(f"Disposition: {result['disposition']}")
     if result.get("failure_kind"):
         lines.append(f"Classification: {result['failure_kind']}")
     if result.get("digest"):
         lines.append(f"Image digest: `{result['digest']}`")
+    if result.get("steps"):
+        lines.extend(["", "### Steps", "", result["steps"]])
+    if result.get("observed"):
+        lines.extend(["", "### Observed", "", result["observed"]])
+    if result.get("expected"):
+        lines.extend(["", "### Expected", "", result["expected"]])
     lines.extend(["", "### Notes", "", result.get("notes") or "_No notes._", "", "### Scenarios", ""])
     for scenario in result.get("scenarios") or []:
         lines.append(f"- {scenario}")

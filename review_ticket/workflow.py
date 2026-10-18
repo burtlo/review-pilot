@@ -37,6 +37,7 @@ from review_ticket.tls_env import zscaler_tls_env
 _LOG = logging.getLogger("review_ticket.workflow")
 from review_ticket.findings import (
     apply_human_decisions,
+    assemble_publication_findings,
     build_review_payload,
     normalize_findings,
     reconcile,
@@ -46,11 +47,17 @@ from review_ticket.policy import (
     Check,
     Readiness,
     bucket_of,
+    TRACK_NAMES,
     classify_check_name,
+    classify_track_status,
     disposition_checklist,
     evaluate_analyzers,
     evaluate_readiness,
+    functional_digest_matches,
+    functional_testing_passed,
+    manual_review_is_complete,
     outcome_is_worse,
+    publication_event_allowed,
     suggest_event as policy_suggest_event,
     testing_outcome,
 )
@@ -73,7 +80,7 @@ from review_ticket.reports import (
     test_results_markdown,
 )
 from review_ticket.runner import Runner
-from review_ticket.storage import Store, read_json, write_json, write_text
+from review_ticket.storage import Store, append_jsonl, read_json, write_json, write_text
 from review_ticket.textutil import parse_unified_diff
 from review_ticket.util import (
     find_pr_urls,
@@ -187,6 +194,9 @@ def resume(app: App, issue: str) -> StepResult:
     if app.refresh:
         _invalidate_step_cache(session)
         app.store.save_session(session)
+    # Publication does not sit in front of virtualization. A saved automated
+    # curation without publication.json is not a blocker. step_publication
+    # only stops the pipeline for an already published Request Changes return.
     steps = (
         step_jira,
         step_pull_request,
@@ -310,7 +320,39 @@ def assess(
     return resume(app, issue)
 
 
-def decide_analyzers(app: App, issue: str, choice: str, notes: str, *, revise: bool) -> StepResult:
+def record_readiness_gate(app: App, issue: str, *, revise: bool) -> StepResult:
+    """Record that the readiness and analyzer gate passed.
+
+    Does not call ``resume``, ``assess``, or a GitHub review API.
+    """
+
+    issue = require_issue_key(issue)
+    session = app.store.ensure_session(issue)
+    put_decision(
+        session,
+        "readiness",
+        {"choice": "approve", "at": iso_now()},
+        revise=revise,
+    )
+    app.store.save_session(session)
+    return StepResult(
+        step=session.get("current_step") or "analyzer-findings",
+        outcome=Outcome.READY,
+        summary="Readiness and analyzer gate recorded. No GitHub review was posted.",
+    )
+
+
+def decide_analyzers(
+    app: App,
+    issue: str,
+    choice: str,
+    notes: str,
+    *,
+    revise: bool,
+    draft_body: str | None = None,
+    resume_after: bool = True,
+    only_shas: tuple[str, ...] | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
     if choice not in {"return", "accept_dispositions", "override"}:
         raise WorkflowError("Analyzer decision must be return, accept_dispositions, or override.")
@@ -321,28 +363,48 @@ def decide_analyzers(app: App, issue: str, choice: str, notes: str, *, revise: b
         scope = _pr_scope(session)
     except WorkflowError as exc:
         raise WorkflowError(f"{exc} Run the review entry point first.") from exc
+    targets = scope
+    if only_shas is not None:
+        wanted = set(only_shas)
+        targets = [item for item in scope if item[3] in wanted]
+        if not targets:
+            raise WorkflowError("No selected pull request matched this analyzer decision.")
     value = {"choice": choice, "notes": notes, "at": iso_now()}
-    for owner, repo, number, sha in scope:
+    for owner, repo, number, sha in targets:
         put_decision(session, "analyzers", value, sha=sha, revise=revise)
     _append_note(app, issue, notes)
     if choice == "return":
-        findings: list[dict[str, Any]] = []
-        links: list[str] = []
-        for owner, repo, number, sha in scope:
-            identity = (owner, repo, number)
-            loaded = _load_analyzer_findings(app, issue, identity, sha)
-            findings.extend(loaded)
-            links.extend(item["url"] for item in loaded if item.get("url"))
-        titles = [f"{item['id']} {item.get('path') or ''} — {item.get('body', '')[:180]}" for item in findings]
-        draft = _write_return_draft(
-            app,
-            issue,
-            reason="Bugbot or CodeQL findings still need a developer disposition.\n\n" + "\n".join(titles),
-            notes=notes,
-            links=links,
-        )
+        if draft_body is not None:
+            draft_path = app.store.issue_dir(issue) / "return-comment.md"
+            write_text(draft_path, draft_body)
+            draft = draft_path
+        else:
+            findings: list[dict[str, Any]] = []
+            links: list[str] = []
+            for owner, repo, number, sha in scope:
+                identity = (owner, repo, number)
+                loaded = _load_analyzer_findings(app, issue, identity, sha)
+                findings.extend(loaded)
+                links.extend(item["url"] for item in loaded if item.get("url"))
+            titles = [
+                f"{item['id']} {item.get('path') or ''} — {item.get('body', '')[:180]}" for item in findings
+            ]
+            draft = _write_return_draft(
+                app,
+                issue,
+                reason="Bugbot or CodeQL findings still need a developer disposition.\n\n" + "\n".join(titles),
+                notes=notes,
+                links=links,
+            )
         session["return_draft"] = str(draft)
     app.store.save_session(session)
+    if not resume_after:
+        outcome = Outcome.ACTION_REQUIRED if choice == "return" else Outcome.READY
+        return StepResult(
+            step=session.get("current_step") or "analyzer-findings",
+            outcome=outcome,
+            summary="Analyzer decision recorded locally.",
+        )
     return resume(app, issue)
 
 
@@ -395,7 +457,14 @@ def select_all_prs(app: App, issue: str) -> StepResult:
     return resume(app, issue)
 
 
-def run_review(app: App, issue: str, *, revise: bool) -> StepResult:
+def run_review(
+    app: App,
+    issue: str,
+    *,
+    revise: bool,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
     session = app.store.ensure_session(issue)
     _LOG.info("run-review: starting for %s", issue)
@@ -412,8 +481,20 @@ def run_review(app: App, issue: str, *, revise: bool) -> StepResult:
             _LOG.info("run-review: stopped at %s (%s)", result.step, result.outcome.value)
             return finish(app, session, result)
         _LOG.debug("run-review: %s complete", label)
+    resolved_identity, resolved_sha = _resolve_pr_target(session, identity, sha)
     _LOG.info("run-review: automated reviewer (may take several minutes)")
-    return finish(app, session, _execute_reviewer(app, session, revise=revise, imported=None))
+    return finish(
+        app,
+        session,
+        _execute_reviewer(
+            app,
+            session,
+            revise=revise,
+            imported=None,
+            identity=resolved_identity,
+            sha=resolved_sha,
+        ),
+    )
 
 
 def import_review(app: App, issue: str, file: Path, *, revise: bool) -> StepResult:
@@ -491,6 +572,8 @@ def save_snapshot_review(
     issue = require_issue_key(issue)
     session = _require_review_session(app, issue)
     resolved_identity = identity or _require_identity(session)
+    if commit_is_historical(app, issue, resolved_identity, sha):
+        raise WorkflowError("This snapshot is historical and read-only. It is not the current HEAD.")
     review_dir = _review_dir(app, issue, resolved_identity, sha)
     document = read_json(review_dir / "findings.json")
     if not document:
@@ -505,6 +588,55 @@ def save_snapshot_review(
         revise=revise,
     )
     put_decision(session, "human_review", {"choice": "recorded", "at": iso_now()}, sha=sha, revise=revise)
+    app.store.save_session(session)
+
+
+def save_publication_draft(
+    app: App,
+    issue: str,
+    draft: dict[str, Any],
+    *,
+    sha: str,
+    identity: tuple[str, str, int] | None = None,
+) -> None:
+    """Persist local GitHub review composition without posting."""
+    issue = require_issue_key(issue)
+    session = _require_review_session(app, issue)
+    resolved_identity = identity or _require_identity(session)
+    if commit_is_historical(app, issue, resolved_identity, sha):
+        raise WorkflowError("This snapshot is historical and read-only. It is not the current HEAD.")
+    payload = dict(draft)
+    payload["sha"] = sha
+    payload["updated_at"] = iso_now()
+    write_json(_review_dir(app, issue, resolved_identity, sha) / "publication-draft.json", payload)
+    app.store.save_session(session)
+
+
+def save_manual_review(
+    app: App,
+    issue: str,
+    document: dict[str, Any],
+    *,
+    sha: str,
+    identity: tuple[str, str, int] | None = None,
+    revise: bool = False,
+    completed: bool = False,
+) -> None:
+    """Persist manual code review for a commit snapshot without publishing to GitHub."""
+    issue = require_issue_key(issue)
+    session = _require_review_session(app, issue)
+    resolved_identity = identity or _require_identity(session)
+    if commit_is_historical(app, issue, resolved_identity, sha):
+        raise WorkflowError("This snapshot is historical and read-only. It is not the current HEAD.")
+    review_dir = _review_dir(app, issue, resolved_identity, sha)
+    existing = read_json(review_dir / "manual-review.json")
+    if existing and existing.get("completed") and not revise:
+        raise WorkflowError("Manual review is already recorded. Pass --revise to replace it.")
+    payload = dict(document)
+    payload["sha"] = sha
+    payload["completed"] = completed
+    payload["recorded_at"] = iso_now()
+    write_json(review_dir / "manual-review.json", payload)
     app.store.save_session(session)
 
 
@@ -531,12 +663,20 @@ def apply_review(app: App, issue: str, human: dict[str, Any], *, revise: bool) -
     return resume(app, issue)
 
 
-def publish_review(app: App, issue: str, *, yes: bool, event: str | None, skip: bool) -> StepResult:
+def publish_review(
+    app: App,
+    issue: str,
+    *,
+    yes: bool,
+    event: str | None,
+    skip: bool,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
-    session = _require_review_session(app, issue)
-    identity = _require_identity(session)
+    session = app.store.ensure_session(issue)
+    identity, sha = _resolve_pr_target(session, identity, sha)
     owner, repo, number = identity
-    sha = session["active_sha"]
     review_dir = _review_dir(app, issue, identity, sha)
     document = read_json(review_dir / "findings.json")
     human = read_json(review_dir / "human-review.json")
@@ -546,19 +686,77 @@ def publish_review(app: App, issue: str, *, yes: bool, event: str | None, skip: 
         raise WorkflowError("The automated review was rejected. Nothing will be published.")
     publication_path = review_dir / "publication.json"
     existing = read_json(publication_path)
-    merged = [] if human.get("rejected_review") else apply_human_decisions(document.get("findings") or [], human)
-    chosen = event or human.get("event") or (policy_suggest_event(merged) if merged else "COMMENT")
-    summary = human.get("summary") or document.get("summary") or "Peer review."
+    draft = read_json(review_dir / "publication-draft.json")
+    if draft and draft.get("sha") != sha:
+        draft = None
+    manual = read_json(review_dir / "manual-review.json")
+    selection = draft.get("selection") if isinstance(draft, dict) else None
+    merged, _omitted = assemble_publication_findings(
+        document,
+        human,
+        manual,
+        selection=selection if isinstance(selection, dict) else None,
+    )
+    chosen = (
+        (draft or {}).get("event")
+        or event
+        or human.get("event")
+        or (policy_suggest_event(merged) if merged else "COMMENT")
+    )
+    chosen = str(chosen).upper()
+    summary = (
+        (draft or {}).get("summary")
+        or human.get("summary")
+        or document.get("summary")
+        or "Peer review."
+    )
+    snapshot_diff = _diff_index(app, issue, identity, sha)
     payload = build_review_payload(
         sha=sha,
         event=chosen,
         summary=summary,
         findings=merged,
-        diff_index=_diff_index(app, issue, identity, sha),
+        diff_index=snapshot_diff,
     )
     digest = fingerprint(payload)
+    testing_dir = _commit_dir(app, issue, identity, sha) / "testing"
+    allowed, reason = publication_event_allowed(
+        chosen,
+        sha=sha,
+        manual_review=read_json(review_dir / "manual-review.json"),
+        test_results=read_json(testing_dir / "test-results.json"),
+        environment=read_json(testing_dir / "environment.json"),
+    )
+    if not allowed:
+        raise WorkflowError(reason)
+    live = get_head_sha(app.runner, app.config, owner, repo, number)
+    refusal = _publication_freshness_refusal(
+        app,
+        issue,
+        identity,
+        sha,
+        live=live,
+        findings=merged,
+        snapshot_diff=snapshot_diff,
+        comments=list(payload.get("comments") or []),
+    )
+    if refusal is not None:
+        return finish(
+            app,
+            session,
+            StepResult(
+                step="human-review",
+                outcome=Outcome.BLOCKED,
+                summary=refusal,
+                next_command=f"review-ticket {issue}",
+            ),
+        )
     if existing and existing.get("status") == "success" and existing.get("fingerprint") == digest:
-        return finish(app, session, _after_publication(app, issue, sha, existing, skipped=True))
+        return finish(
+            app,
+            session,
+            _after_publication(app, issue, identity, sha, existing, skipped=True),
+        )
     if skip:
         preview = f"Skip GitHub publication for {owner}/{repo}#{number} at {short_sha(sha)} with event {chosen}."
         authorize(preview=preview, yes=yes, interactive=app.interactive, prompt=app.input_fn, write=app.write)
@@ -569,30 +767,15 @@ def publish_review(app: App, issue: str, *, yes: bool, event: str | None, skip: 
             "event": chosen,
             "published_at": iso_now(),
         }
-        write_json(publication_path, receipt)
+        _store_publication_receipt(review_dir, receipt)
         _journal(app, issue, _commit_dir(app, issue, identity, sha), "github.review", digest, "success", receipt, sha)
-        return finish(app, session, _after_publication(app, issue, sha, receipt, skipped=False))
+        return finish(app, session, _after_publication(app, issue, identity, sha, receipt, skipped=False))
 
-    live = get_head_sha(app.runner, app.config, owner, repo, number)
-    if live != sha:
-        return finish(
-            app,
-            session,
-            StepResult(
-                step="human-review",
-                outcome=Outcome.BLOCKED,
-                summary=(
-                    f"Refusing to publish. Pull request HEAD is {short_sha(live)}, "
-                    f"but this review snapshot is {short_sha(sha)}."
-                ),
-                next_command=f"review-ticket {issue}",
-            ),
-        )
     remote = _matching_remote_review(app, owner, repo, number, payload)
     if remote is not None:
         receipt = _receipt_from_remote(remote, digest, sha, chosen)
-        write_json(publication_path, receipt)
-        return finish(app, session, _after_publication(app, issue, sha, receipt, skipped=True))
+        _store_publication_receipt(review_dir, receipt)
+        return finish(app, session, _after_publication(app, issue, identity, sha, receipt, skipped=True))
 
     preview = _publication_preview(owner, repo, number, payload)
     authorize(preview=preview, yes=yes, interactive=app.interactive, prompt=app.input_fn, write=app.write)
@@ -632,16 +815,21 @@ def publish_review(app: App, issue: str, *, yes: bool, event: str | None, skip: 
         "comment_urls": [item.get("html_url") or item.get("url") for item in comments],
         "published_at": iso_now(),
     }
-    write_json(publication_path, receipt)
+    _store_publication_receipt(review_dir, receipt)
     _journal(app, issue, _commit_dir(app, issue, identity, sha), "github.review", digest, "success", receipt, sha)
-    return finish(app, session, _after_publication(app, issue, sha, receipt, skipped=False))
+    return finish(app, session, _after_publication(app, issue, identity, sha, receipt, skipped=False))
 
 
-def prepare_profile(app: App, issue: str) -> StepResult:
+def prepare_profile(
+    app: App,
+    issue: str,
+    *,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
-    session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    session = app.store.ensure_session(issue)
+    identity, sha = _resolve_pr_target(session, identity, sha)
     pr = _load_pr(app, issue, identity)
     profile_dir = _commit_dir(app, issue, identity, sha) / "testing" / "profile"
     desired = _desired_profile(app, issue, pr, sha)
@@ -665,11 +853,16 @@ def prepare_profile(app: App, issue: str) -> StepResult:
     )
 
 
-def fetch_image(app: App, issue: str) -> StepResult:
+def fetch_image(
+    app: App,
+    issue: str,
+    *,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
-    session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    session = app.store.ensure_session(issue)
+    identity, sha = _resolve_pr_target(session, identity, sha)
     profile_dir = _commit_dir(app, issue, identity, sha) / "testing" / "profile"
     profile_path = profile_dir / "profile.json"
     profile = read_json(profile_path)
@@ -689,6 +882,9 @@ def fetch_image(app: App, issue: str) -> StepResult:
         "changed": changed,
         "fetched_at": iso_now(),
     }
+    if changed:
+        environment.pop("launched_at", None)
+        environment.pop("launched_digest", None)
     testing_dir = _commit_dir(app, issue, identity, sha) / "testing"
     write_json(testing_dir / "environment.json", environment)
     profile["image_digest"] = digest
@@ -712,11 +908,16 @@ def fetch_image(app: App, issue: str) -> StepResult:
     )
 
 
-def launch_environment(app: App, issue: str) -> StepResult:
+def launch_environment(
+    app: App,
+    issue: str,
+    *,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
-    session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    session = app.store.ensure_session(issue)
+    identity, sha = _resolve_pr_target(session, identity, sha)
     testing_dir = _commit_dir(app, issue, identity, sha) / "testing"
     profile = read_json(testing_dir / "profile" / "profile.json")
     environment = read_json(testing_dir / "environment.json")
@@ -729,6 +930,9 @@ def launch_environment(app: App, issue: str) -> StepResult:
         docker_compose_up(app.runner, app.config, profile["project_name"], compose)
     except ToolError as exc:
         return finish(app, session, _blocked("virtualization", str(exc)))
+    environment["launched_at"] = iso_now()
+    environment["launched_digest"] = environment.get("digest")
+    write_json(testing_dir / "environment.json", environment)
     return finish(
         app,
         session,
@@ -759,6 +963,83 @@ def write_test_plan_command(app: App, issue: str) -> StepResult:
     )
 
 
+def save_functional_testing(
+    app: App,
+    issue: str,
+    document: dict[str, Any],
+    *,
+    sha: str,
+    identity: tuple[str, str, int] | None = None,
+    revise: bool = False,
+    completed: bool = False,
+) -> None:
+    """Persist functional testing for a commit snapshot without publishing to GitHub."""
+    issue = require_issue_key(issue)
+    session = _require_review_session(app, issue)
+    resolved_identity = identity or _require_identity(session)
+    if commit_is_historical(app, issue, resolved_identity, sha):
+        raise WorkflowError("This snapshot is historical and read-only. It is not the current HEAD.")
+    testing_dir = _commit_dir(app, issue, resolved_identity, sha) / "testing"
+    existing = read_json(testing_dir / "test-results.json")
+    if existing and existing.get("completed", True) and not revise:
+        raise WorkflowError("Test results already exist for this SHA. Pass --revise to replace them.")
+    environment = read_json(testing_dir / "environment.json") or {}
+    payload = _assemble_test_results_payload(
+        document,
+        sha=sha,
+        environment=environment,
+        evidence_paths=document.get("evidence") or [],
+        testing_dir=testing_dir,
+        completed=completed,
+    )
+    write_json(testing_dir / "test-results.json", payload)
+    if completed:
+        write_text(testing_dir / "test-results.md", test_results_markdown(payload))
+        write_text(testing_dir / "comment.md", functional_comment(payload))
+    app.store.save_session(session)
+
+
+def _assemble_test_results_payload(
+    fields: dict[str, Any],
+    *,
+    sha: str,
+    environment: dict[str, Any],
+    evidence_paths: list[str],
+    testing_dir: Path,
+    completed: bool,
+) -> dict[str, Any]:
+    stored_evidence = _store_evidence(testing_dir, [p for p in evidence_paths if p]) if evidence_paths else []
+    existing_evidence = fields.get("evidence") or []
+    if existing_evidence and not evidence_paths:
+        stored_evidence = list(existing_evidence)
+    result = fields.get("result")
+    kind = fields.get("failure_kind")
+    if result == "pass":
+        kind = None
+    if result == "blocked":
+        kind = kind or "environment"
+    tested_at = fields.get("tested_at") or fields.get("recorded_at") or iso_now()
+    return {
+        "sha": sha,
+        "image": environment.get("image"),
+        "digest": environment.get("digest"),
+        "result": result,
+        "failure_kind": kind,
+        "steps": str(fields.get("steps") or ""),
+        "observed": str(fields.get("observed") or ""),
+        "expected": str(fields.get("expected") or ""),
+        "plan_reference": str(fields.get("plan_reference") or ""),
+        "notes": str(fields.get("notes") or ""),
+        "scenarios": list(fields.get("scenarios") or []),
+        "evidence": stored_evidence,
+        "disposition": fields.get("disposition"),
+        "p9_handoff": fields.get("p9_handoff"),
+        "tested_at": tested_at,
+        "recorded_at": iso_now(),
+        "completed": completed,
+    }
+
+
 def record_tests(
     app: App,
     issue: str,
@@ -769,6 +1050,14 @@ def record_tests(
     scenarios: list[str],
     evidence: list[str],
     revise: bool,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+    steps: str = "",
+    observed: str = "",
+    expected: str = "",
+    plan_reference: str = "",
+    disposition: str | None = None,
+    tested_at: str | None = None,
 ) -> StepResult:
     issue = require_issue_key(issue)
     if result not in {"pass", "fail", "blocked"}:
@@ -779,26 +1068,35 @@ def record_tests(
         kind = kind or "environment"
     if result == "pass":
         kind = None
-    session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    if disposition == "REQUEST_CHANGES" and (result == "blocked" or kind == "environment"):
+        disposition = None
+    session = app.store.ensure_session(issue)
+    identity, sha = _resolve_pr_target(session, identity, sha)
     testing_dir = _commit_dir(app, issue, identity, sha) / "testing"
     existing = read_json(testing_dir / "test-results.json")
     if existing and not revise:
         raise WorkflowError("Test results already exist for this SHA. Pass --revise to replace them.")
     environment = read_json(testing_dir / "environment.json") or {}
-    stored_evidence = _store_evidence(testing_dir, evidence)
-    payload = {
-        "sha": sha,
-        "image": environment.get("image"),
-        "digest": environment.get("digest"),
+    fields = {
         "result": result,
         "failure_kind": kind,
         "notes": notes,
         "scenarios": scenarios,
-        "evidence": stored_evidence,
-        "recorded_at": iso_now(),
+        "steps": steps,
+        "observed": observed,
+        "expected": expected,
+        "plan_reference": plan_reference,
+        "disposition": disposition,
+        "tested_at": tested_at,
     }
+    payload = _assemble_test_results_payload(
+        fields,
+        sha=sha,
+        environment=environment,
+        evidence_paths=evidence,
+        testing_dir=testing_dir,
+        completed=True,
+    )
     write_json(testing_dir / "test-results.json", payload)
     write_text(testing_dir / "test-results.md", test_results_markdown(payload))
     comment = functional_comment(payload)
@@ -806,7 +1104,7 @@ def record_tests(
     put_decision(
         session,
         "testing",
-        {"choice": result, "kind": kind, "at": iso_now()},
+        {"choice": result, "kind": kind, "disposition": disposition, "at": iso_now()},
         sha=sha,
         revise=revise,
     )
@@ -1056,6 +1354,7 @@ def record_disposition(
     notes: str,
     override: bool,
     revise: bool,
+    draft_body: str | None = None,
 ) -> StepResult:
     issue = require_issue_key(issue)
     if choice not in {"approve", "leave", "return"}:
@@ -1068,7 +1367,7 @@ def record_disposition(
             return finish(app, session, result)
     identity = _require_identity(session)
     sha = session["active_sha"]
-    checklist = _build_checklist(app, session)
+    checklist = _build_ticket_checklist(app, session)
     failing = [item for item in checklist if not item["ok"]]
     if choice == "approve" and failing and not override:
         raise WorkflowError(
@@ -1077,27 +1376,28 @@ def record_disposition(
         )
     if override and not notes.strip():
         raise WorkflowError("A disposition override needs --notes.")
+    if choice == "return" and draft_body is not None:
+        write_text(app.store.issue_dir(issue) / "return-comment.md", draft_body)
     put_decision(
         session,
         "disposition",
         {"choice": choice, "notes": notes, "override": override, "at": iso_now()},
-        sha=sha,
         revise=revise,
     )
     _append_note(app, issue, notes)
-    path = _commit_dir(app, issue, identity, sha) / "disposition.json"
+    path = app.store.issue_dir(issue) / "disposition.json"
     write_json(
         path,
         {
             "choice": choice,
             "notes": notes,
             "override": override,
-            "sha": sha,
+            "active_sha": sha,
             "checklist": checklist,
             "at": iso_now(),
         },
     )
-    write_text(_commit_dir(app, issue, identity, sha) / "disposition.md", disposition_report(checklist, sha=sha))
+    write_text(app.store.issue_dir(issue) / "disposition.md", disposition_report(checklist, sha=sha))
     if choice == "leave":
         return finish(
             app,
@@ -1258,6 +1558,7 @@ def _sync_pull_request(
         prior = session.setdefault("previous_shas", [])
         if previous_sha not in prior:
             prior.append(previous_sha)
+        _mark_sha_historical(app, session, issue, owner, repo, number, previous_sha, sha)
     pr_dir = app.store.pr_dir(issue, owner, repo, number)
     write_json(pr_dir / "pr.json", pr)
     snapshot = {
@@ -1703,36 +2004,18 @@ def step_automated_review(app: App, session: dict[str, Any]) -> StepResult | Non
 
 
 def step_publication(app: App, session: dict[str, Any]) -> StepResult | None:
+    """Report publication state without blocking virtualization.
+
+    Missing publication.json is not a pipeline stop. publish-review is still
+    the command that writes a GitHub review. A published Request Changes
+    receipt still waits on the Jira return transition.
+    """
     issue = session["issue"]
     identity = _require_identity(session)
     sha = session["active_sha"]
-    review_dir = _review_dir(app, issue, identity, sha)
-    human = read_json(review_dir / "human-review.json")
-    if not human:
-        return StepResult(
-            step="human-review",
-            outcome=Outcome.REVIEW_DECISION,
-            summary="Accept, reject, or edit the automated findings before publication.",
-            next_command=f"review-ticket {issue} attach",
-            report_path=str(review_dir / "reviewer-report.md"),
-        )
-    if human.get("rejected_review"):
-        return StepResult(
-            step="human-review",
-            outcome=Outcome.REVIEW_DECISION,
-            summary="The automated review was rejected locally and has not been published.",
-            next_command=f"review-ticket {issue} run-review --revise",
-            report_path=str(review_dir / "findings.json"),
-        )
-    publication = read_json(review_dir / "publication.json")
+    publication = read_json(_review_dir(app, issue, identity, sha) / "publication.json")
     if not publication:
-        return StepResult(
-            step="human-review",
-            outcome=Outcome.REVIEW_DECISION,
-            summary="The local review is ready to publish. GitHub has not been changed.",
-            next_command=f"review-ticket {issue} publish-review --yes",
-            report_path=str(review_dir / "proposed-review.json"),
-        )
+        return None
     return _publication_gate(app, issue, sha, publication)
 
 
@@ -1748,7 +2031,6 @@ def step_virtualization(app: App, session: dict[str, Any]) -> StepResult | None:
             outcome=Outcome.READY,
             summary="Prepare an isolated virtualization profile for this SHA.",
             next_command=f"review-ticket {issue} test prepare",
-            details={"completed_step": "human-review"},
         )
     environment = read_json(testing_dir / "environment.json")
     if not environment or environment.get("sha") != sha or not environment.get("digest"):
@@ -1817,9 +2099,9 @@ def step_disposition(app: App, session: dict[str, Any]) -> StepResult | None:
     issue = session["issue"]
     identity = _require_identity(session)
     sha = session["active_sha"]
-    decision = get_decision(session, "disposition", sha)
-    checklist = _build_checklist(app, session)
-    path = _commit_dir(app, issue, identity, sha) / "disposition.md"
+    decision = get_decision(session, "disposition")
+    checklist = _build_ticket_checklist(app, session)
+    path = app.store.issue_dir(issue) / "disposition.md"
     write_text(path, disposition_report(checklist, sha=sha))
     if decision and decision.get("choice") == "approve":
         if _transition_recorded(app, issue, app.config.approved_status, sha):
@@ -2078,10 +2360,17 @@ def _write_review_preview_markdown(
     )
 
 
-def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, imported: Any | None) -> StepResult:
+def _execute_reviewer(
+    app: App,
+    session: dict[str, Any],
+    *,
+    revise: bool,
+    imported: Any | None,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> StepResult:
     issue = session["issue"]
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+    identity, sha = _resolve_pr_target(session, identity, sha)
     review_dir = _review_dir(app, issue, identity, sha)
     if any((review_dir / name).exists() for name in ("findings.json", "human-review.json")) and not revise:
         raise WorkflowError("A review already exists for this SHA. Pass --revise to archive it and run again.")
@@ -2089,11 +2378,11 @@ def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, import
         _archive_review(review_dir)
     repository = f"{identity[0]}/{identity[1]}"
     _LOG.debug("preparing review context for %s @ %s", repository, sha)
-    diff_text = _ensure_diff(app, session)
+    diff_text = _ensure_diff(app, session, identity, sha)
     index = parse_unified_diff(diff_text)
     write_json(review_dir / "diff-lines.json", sorted([list(item) for item in index]))
     output = review_dir / "reviewer-output.json"
-    context = _write_context(app, session, diff_text, output)
+    context = _write_context(app, session, diff_text, output, identity, sha)
     reviewer_command, reviewer_route, reviewer_profile = app.config.resolve_reviewer(repository)
     if imported is None:
         if not reviewer_command:
@@ -2191,10 +2480,13 @@ def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, import
     )
 
 
-def _ensure_diff(app: App, session: dict[str, Any]) -> str:
+def _ensure_diff(
+    app: App,
+    session: dict[str, Any],
+    identity: tuple[str, str, int],
+    sha: str,
+) -> str:
     issue = session["issue"]
-    identity = _require_identity(session)
-    sha = session["active_sha"]
     commit_dir = _commit_dir(app, issue, identity, sha)
     existing = commit_dir / "diff.patch"
     if existing.exists() and (commit_dir / "review" / "diff-lines.json").exists():
@@ -2221,10 +2513,15 @@ def _ensure_diff(app: App, session: dict[str, Any]) -> str:
     return diff_text
 
 
-def _write_context(app: App, session: dict[str, Any], diff_text: str, output: Path) -> Path:
+def _write_context(
+    app: App,
+    session: dict[str, Any],
+    diff_text: str,
+    output: Path,
+    identity: tuple[str, str, int],
+    sha: str,
+) -> Path:
     issue = session["issue"]
-    identity = _require_identity(session)
-    sha = session["active_sha"]
     context = _review_dir(app, issue, identity, sha) / "context"
     normalized = read_json(app.store.issue_dir(issue) / "issue.json") or {}
     write_text(
@@ -2280,15 +2577,243 @@ def _previous_finding_rows(app: App, issue: str, identity: tuple[str, str, int],
     return rows
 
 
-def _diff_index(app: App, issue: str, identity: tuple[str, str, int], sha: str) -> set[tuple[str, int, str]]:
+def _stored_diff_index(
+    app: App,
+    issue: str,
+    identity: tuple[str, str, int],
+    sha: str,
+) -> set[tuple[str, int, str]] | None:
     review_dir = _review_dir(app, issue, identity, sha)
     stored = read_json(review_dir / "diff-lines.json")
     if isinstance(stored, list):
-        return {(item[0], int(item[1]), item[2]) for item in stored}
+        index: set[tuple[str, int, str]] = set()
+        for item in stored:
+            if isinstance(item, (list, tuple)) and len(item) >= 3:
+                index.add((str(item[0]), int(item[1]), str(item[2])))
+        return index
     diff_path = _commit_dir(app, issue, identity, sha) / "diff.patch"
     if diff_path.exists():
         return parse_unified_diff(diff_path.read_text(encoding="utf-8"))
-    raise WorkflowError("No diff index is stored for this SHA. Run run-review again.")
+    return None
+
+
+def _diff_index(app: App, issue: str, identity: tuple[str, str, int], sha: str) -> set[tuple[str, int, str]]:
+    index = _stored_diff_index(app, issue, identity, sha)
+    if index is None:
+        raise WorkflowError("No diff index is stored for this SHA. Run run-review again.")
+    return index
+
+
+def _prior_diff_index(
+    app: App,
+    issue: str,
+    identity: tuple[str, str, int],
+    sha: str,
+) -> set[tuple[str, int, str]]:
+    """Diff locations recorded on other commit directories for this pull request."""
+
+    owner, repo, number = identity
+    commits = app.store.pr_dir(issue, owner, repo, number) / "commits"
+    index: set[tuple[str, int, str]] = set()
+    if not commits.exists():
+        return index
+    for path in commits.iterdir():
+        if not path.is_dir() or path.name == sha:
+            continue
+        sibling = _stored_diff_index(app, issue, identity, path.name)
+        if sibling:
+            index.update(sibling)
+    return index
+
+
+def incompatible_inline_locations(
+    findings: list[dict[str, Any]],
+    *,
+    snapshot_diff: set[tuple[str, int, str]],
+    new_diff: set[tuple[str, int, str]] | None,
+    prior_diff: set[tuple[str, int, str]],
+    live_matches_snapshot: bool,
+    comments: list[dict[str, Any]] | None = None,
+) -> list[tuple[str, int, str]]:
+    """Inline locations that do not land on the diff for the HEAD being published.
+
+    A path and line is an inline comment when it sits on this snapshot's diff or
+    on an earlier commit's diff. Findings that were never on a diff stay summary
+    comments. When the live HEAD has no stored diff, those inline locations are
+    not on the new diff.
+    """
+
+    target = snapshot_diff if live_matches_snapshot else new_diff
+    missing: list[tuple[str, int, str]] = []
+    seen: set[tuple[str, int, str]] = set()
+
+    def consider(loc: tuple[str, int, str], *, inline: bool) -> None:
+        if not inline or loc in seen:
+            return
+        if target is None or loc not in target:
+            seen.add(loc)
+            missing.append(loc)
+
+    for finding in findings:
+        if finding.get("decision") == "reject":
+            continue
+        path = finding.get("path")
+        line = finding.get("line")
+        if not path or not isinstance(line, int):
+            continue
+        loc = (str(path), int(line), str(finding.get("side") or "RIGHT"))
+        consider(loc, inline=loc in snapshot_diff or loc in prior_diff)
+    for comment in comments or []:
+        path = comment.get("path")
+        line = comment.get("line")
+        if not path or not isinstance(line, int):
+            continue
+        loc = (str(path), int(line), str(comment.get("side") or "RIGHT"))
+        consider(loc, inline=True)
+    return missing
+
+
+def _publication_freshness_refusal(
+    app: App,
+    issue: str,
+    identity: tuple[str, str, int],
+    sha: str,
+    *,
+    live: str,
+    findings: list[dict[str, Any]],
+    snapshot_diff: set[tuple[str, int, str]],
+    comments: list[dict[str, Any]],
+) -> str | None:
+    """Refuse a stale HEAD or inline comments that are not on the new diff."""
+
+    live_matches = live == sha
+    new_diff = snapshot_diff if live_matches else _stored_diff_index(app, issue, identity, live)
+    missing = incompatible_inline_locations(
+        findings,
+        snapshot_diff=snapshot_diff,
+        new_diff=new_diff,
+        prior_diff=_prior_diff_index(app, issue, identity, sha),
+        live_matches_snapshot=live_matches,
+        comments=comments,
+    )
+    if live_matches and not missing:
+        return None
+    parts = ["Refusing to publish."]
+    if not live_matches:
+        parts.append(
+            f"Pull request HEAD is {short_sha(live)}, but this review snapshot is {short_sha(sha)}."
+        )
+    if missing:
+        places = ", ".join(f"{path}:{line}" for path, line, _side in missing)
+        target = short_sha(live)
+        parts.append(f"Inline comment locations are not on the diff for {target}: {places}.")
+    return " ".join(parts)
+
+
+def commit_is_historical(app: App, issue: str, identity: tuple[str, str, int], sha: str) -> bool:
+    marker = read_json(_commit_dir(app, issue, identity, sha) / "historical.json")
+    return isinstance(marker, dict) and bool(marker.get("historical")) and str(marker.get("sha") or "") == sha
+
+
+def _mark_sha_historical(
+    app: App,
+    session: dict[str, Any],
+    issue: str,
+    owner: str,
+    repo: str,
+    number: int,
+    previous_sha: str,
+    new_sha: str,
+) -> None:
+    """Mark one PR's previous SHA historical.
+
+    The old commit directory stays in place. SHA-scoped decisions, approvals,
+    and receipts are not copied onto ``new_sha``. Other pull requests and the
+    ticket-scoped testing-notes decision are left untouched.
+    """
+
+    ref = _pr_ref(owner, repo, number)
+    history = session.setdefault("sha_history", {})
+    if not isinstance(history, dict):
+        history = {}
+        session["sha_history"] = history
+    entries = history.get(ref)
+    if not isinstance(entries, list):
+        entries = []
+        history[ref] = entries
+    if not any(
+        isinstance(item, dict) and item.get("sha") == previous_sha and item.get("superseded_by") == new_sha
+        for item in entries
+    ):
+        entries.append(
+            {
+                "sha": previous_sha,
+                "superseded_by": new_sha,
+                "historical": True,
+                "at": iso_now(),
+            }
+        )
+    old_dir = app.store.commit_dir(issue, owner, repo, number, previous_sha)
+    if not old_dir.exists():
+        return
+    write_json(
+        old_dir / "historical.json",
+        {
+            "historical": True,
+            "read_only": True,
+            "sha": previous_sha,
+            "superseded_by": new_sha,
+            "marked_at": iso_now(),
+            "tracks": list(TRACK_NAMES),
+        },
+    )
+
+
+def _build_ticket_checklist(app: App, session: dict[str, Any]) -> list[dict[str, Any]]:
+    from review_ticket.policy import disposition_checklist
+    from review_ticket.ticket_disposition import build_checklist_facts
+
+    issue = session["issue"]
+    items: list[dict[str, Any]] = []
+    testing = get_decision(session, "testing_notes")
+    items.append(
+        {
+            "id": "testing_notes",
+            "detail": "Testing notes were accepted.",
+            "ok": (testing or {}).get("choice") == "accept",
+        }
+    )
+    readiness = get_decision(session, "readiness")
+    items.append(
+        {
+            "id": "readiness",
+            "detail": "PR readiness and analyzer gate passed.",
+            "ok": (readiness or {}).get("choice") == "approve",
+        }
+    )
+    try:
+        scope = _pr_scope(session)
+    except WorkflowError:
+        scope = []
+    for owner, repo, number, sha in scope:
+        prefix = f"{owner}/{repo}#{number} @ {short_sha(sha)}"
+        facts = build_checklist_facts(app.store, issue, session, owner, repo, number, sha)
+        for row in disposition_checklist(facts):
+            items.append(
+                {
+                    "id": f"{owner}/{repo}#{number}:{row['id']}",
+                    "detail": f"{prefix}: {row['detail']}",
+                    "ok": row["ok"],
+                }
+            )
+        items.append(
+            {
+                "id": f"{owner}/{repo}#{number}:github_approve",
+                "detail": f"{prefix}: GitHub review was published with Approve.",
+                "ok": bool(facts.get("github_approve")),
+            }
+        )
+    return items
 
 
 def _build_checklist(app: App, session: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2315,31 +2840,33 @@ def _build_checklist(app: App, session: dict[str, Any]) -> list[dict[str, Any]]:
         except WorkflowError:
             merged = []
         open_must_fix = any(item.get("must_fix") and item.get("decision") != "reject" for item in merged)
-    publication = read_json(commit_dir / "review" / "publication.json") or {}
-    human_done = bool(human) and not human.get("rejected_review") and publication.get("status") in {"success", "skipped"}
+    manual = read_json(commit_dir / "review" / "manual-review.json")
     results = read_json(commit_dir / "testing" / "test-results.json") or {}
     environment = read_json(commit_dir / "testing" / "environment.json") or {}
-    testing_passed = results.get("result") == "pass" and results.get("sha") == sha
-    evidence = (
-        testing_passed
-        and results.get("digest")
-        and results.get("digest") == environment.get("digest")
-        and environment.get("sha") == sha
-    )
+    testing_passed = functional_testing_passed(results, sha, environment)
+    evidence = functional_digest_matches(results, environment, sha) and results.get("result") == "pass"
     return disposition_checklist(
         {
             "sha_matches": True,
             "checks_passed": checks,
             "analyzers_clear": analyzers_clear,
             "open_must_fix": open_must_fix,
-            "human_review": human_done,
+            "manual_review": manual_review_is_complete(manual, sha),
             "testing_passed": testing_passed,
             "evidence_matches": bool(evidence),
         }
     )
 
 
-def _after_publication(app: App, issue: str, sha: str, receipt: dict[str, Any], *, skipped: bool) -> StepResult:
+def _after_publication(
+    app: App,
+    issue: str,
+    identity: tuple[str, str, int],
+    sha: str,
+    receipt: dict[str, Any],
+    *,
+    skipped: bool,
+) -> StepResult:
     event = receipt.get("event")
     prefix = "GitHub review was already published." if skipped and receipt.get("status") == "success" else "Recorded the GitHub review."
     if event == "REQUEST_CHANGES":
@@ -2350,6 +2877,17 @@ def _after_publication(app: App, issue: str, sha: str, receipt: dict[str, Any], 
             recommendation=app.config.in_progress_status,
             next_command=f"review-ticket {issue} jira transition --status {json_quote(app.config.in_progress_status)} --yes",
             details={"completed_step": "human-review", "github_review_id": receipt.get("github_review_id")},
+        )
+    testing_dir = _commit_dir(app, issue, identity, sha) / "testing"
+    results = read_json(testing_dir / "test-results.json")
+    environment = read_json(testing_dir / "environment.json")
+    if functional_testing_passed(results, sha, environment):
+        return StepResult(
+            step="disposition",
+            outcome=Outcome.REVIEW_DECISION,
+            summary=prefix + " Functional testing is already recorded for this SHA.",
+            next_command=f"review-ticket {issue} disposition --choice approve",
+            details={"github_review_id": receipt.get("github_review_id"), "sha": sha},
         )
     summary = prefix + " The issue stays in Peer Review."
     if event == "APPROVE":
@@ -2668,6 +3206,63 @@ def _require_identity(session: dict[str, Any]) -> tuple[str, str, int]:
     return identity
 
 
+def _resolve_pr_target(
+    session: dict[str, Any],
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> tuple[tuple[str, str, int], str]:
+    """Use the active pull request unless the caller names another PR and SHA.
+
+    Naming a PR does not call pr select and does not change pr_scope.
+    """
+    if identity is None and sha is None:
+        resolved = _require_identity(session)
+        return resolved, str(session["active_sha"])
+    if identity is None or not sha:
+        raise WorkflowError(
+            "Pass both the pull request identity and SHA, or omit both to use the active pull request."
+        )
+    owner, repo, number = identity
+    return (str(owner), str(repo), int(number)), str(sha)
+
+
+def read_track_status(
+    app: App,
+    issue: str,
+    identity: tuple[str, str, int],
+    sha: str,
+    *,
+    current_sha: str | None = None,
+) -> dict[str, str]:
+    """Read automated, manual, functional, and publication status for one PR SHA."""
+    issue = require_issue_key(issue)
+    commit_dir = _commit_dir(app, issue, identity, sha)
+    review_dir = commit_dir / "review"
+    if current_sha is None:
+        session = read_json(app.store.issue_dir(issue) / "session.json") or {}
+        ref = f"{identity[0]}/{identity[1]}#{identity[2]}"
+        current_sha = (session.get("pr_shas") or {}).get(ref)
+        if current_sha is None and session.get("active_pr") == ref:
+            current_sha = session.get("active_sha")
+    testing_dir = commit_dir / "testing"
+    return classify_track_status(
+        sha=sha,
+        current_sha=current_sha,
+        findings=read_json(review_dir / "findings.json"),
+        human_review=read_json(review_dir / "human-review.json"),
+        manual_review=read_json(review_dir / "manual-review.json"),
+        test_results=read_json(testing_dir / "test-results.json"),
+        publication=read_json(review_dir / "publication.json"),
+        environment=read_json(testing_dir / "environment.json"),
+    )
+
+
+def _store_publication_receipt(review_dir: Path, receipt: dict[str, Any]) -> None:
+    """Write the latest receipt and append it to the publication history."""
+    write_json(review_dir / "publication.json", receipt)
+    append_jsonl(review_dir / "publications.jsonl", receipt)
+
+
 def _require_review_session(app: App, issue: str) -> dict[str, Any]:
     session = app.store.ensure_session(issue)
     _require_identity(session)
@@ -2820,11 +3415,11 @@ def _review_chain_hint(issue: str, result: StepResult) -> str:
     ):
         return (
             f"chain: {prefix} run-review → {prefix} import-review → "
-            f"{prefix} attach → {prefix} publish-review --yes"
+            f"{prefix} attach → {prefix} test prepare → {prefix} publish-review --yes"
         )
     return (
         f"chain: {prefix} run-review → {prefix} attach → "
-        f"{prefix} publish-review --yes"
+        f"{prefix} test prepare → {prefix} publish-review --yes"
     )
 
 
