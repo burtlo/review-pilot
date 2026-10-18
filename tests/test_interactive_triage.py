@@ -154,12 +154,23 @@ def test_run_review_attach_requires_tty(tmp_path):
         run_review_attach(app, ISSUE, revise=False)
 
 
-def test_run_review_attach_missing_session(tmp_path):
+def test_run_review_attach_bootstraps_missing_session(tmp_path, monkeypatch):
     app, _, _ = make_app(tmp_path)
     app.interactive = True
-    with pytest.raises(WorkflowError, match=f"review-ticket {ISSUE}` first"):
-        run_review_attach(app, ISSUE, revise=False)
+    constructed: list[object] = []
+
+    class _StubApp:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr("review_ticket.tui.ReviewTicketApp", _StubApp)
     assert not (tmp_path / "reviews" / ISSUE / "session.json").exists()
+    run_review_attach(app, ISSUE, revise=False)
+    assert (tmp_path / "reviews" / ISSUE / "session.json").exists()
+    assert constructed
 
 
 def test_cli_review_attach_is_invalid(tmp_path):

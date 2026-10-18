@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from review_ticket.textutil import format_jira_body_markdown
+
 
 def issue_report(issue: dict[str, Any]) -> str:
     comments = issue.get("comments") or []
@@ -57,18 +59,64 @@ Full issue context: {report_path}
 """
 
 
+def testing_notes_assessment_markdown(issue: dict[str, Any]) -> str:
+    """Markdown for the TUI testing-notes assessment panel (extracted notes + workflow hint)."""
+
+    testing_raw = (issue.get("testing_notes") or "").strip()
+    acceptance_raw = (issue.get("acceptance_criteria") or "").strip()
+    status = issue.get("status") or "unknown"
+
+    lines = [
+        f"**Issue status:** {status}",
+        "",
+    ]
+    if testing_raw:
+        lines.append("**Detected testing notes** (from Jira fields / description sections):")
+        lines.append("")
+        lines.append(format_jira_body_markdown(testing_raw).strip())
+        lines.append("")
+        lines.append(
+            "**Recommendation:** Notes are present — **Accept** if they are adequate for peer review, "
+            "or **Reject** to return the issue with a comment."
+        )
+    else:
+        lines.append("_No testing notes were detected on this issue._")
+        lines.append("")
+        lines.append(
+            "**Recommendation:** Missing notes — the workflow default is **Reject** and transition back to "
+            "In Progress. Use **Accept** if notes appear in the ticket description but were not detected."
+        )
+    if acceptance_raw:
+        lines.extend(
+            [
+                "",
+                "## Acceptance criteria",
+                "",
+                format_jira_body_markdown(acceptance_raw).strip(),
+            ]
+        )
+    return "\n".join(lines).strip() + "\n"
+
+
+def _check_name_markdown(name: str, link: str | None) -> str:
+    display = name or ""
+    url = (link or "").strip()
+    if url:
+        return f"[{display}]({url})"
+    return display
+
+
 def format_checks_table(checks: list[dict[str, Any]]) -> str:
-    rows = ["| Check | Required | Status | State | Link |", "| --- | --- | --- | --- | --- |"]
+    rows = ["| Check | Required | Status | State |", "| --- | --- | --- | --- |"]
     for check in checks:
         bucket = check.get("bucket") or ""
         status = _check_status_label(bucket)
         rows.append(
-            "| {name} | {required} | {status} | {state} | {link} |".format(
-                name=check.get("name") or "",
+            "| {name} | {required} | {status} | {state} |".format(
+                name=_check_name_markdown(check.get("name") or "", check.get("link")),
                 required="yes" if check.get("required") else "no",
                 status=status,
                 state=check.get("state") or "",
-                link=check.get("link") or "",
             )
         )
     return "\n".join(rows) if checks else "_No checks were reported._"
@@ -175,15 +223,14 @@ def readiness_report(
     outcome: str,
     summary: str,
 ) -> str:
-    rows = ["| Check | Required | Bucket | State | Link |", "| --- | --- | --- | --- | --- |"]
+    rows = ["| Check | Required | Bucket | State |", "| --- | --- | --- | --- |"]
     for check in checks:
         rows.append(
-            "| {name} | {required} | {bucket} | {state} | {link} |".format(
-                name=check.get("name") or "",
+            "| {name} | {required} | {bucket} | {state} |".format(
+                name=_check_name_markdown(check.get("name") or "", check.get("link")),
                 required="yes" if check.get("required") else "no",
                 bucket=check.get("bucket") or "",
                 state=check.get("state") or "",
-                link=check.get("link") or "",
             )
         )
     draft = "yes" if pr.get("draft") else "no"

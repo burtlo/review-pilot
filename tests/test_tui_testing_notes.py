@@ -12,10 +12,13 @@ from review_ticket.tui.status_screen import StatusScreen
 from review_ticket.tui.testing_notes_screen import TestingNotesScreen
 from review_ticket.util import sha256_text
 from review_ticket.workflow import decide_notes
-from textual.widgets import Button, Link, Markdown, TextArea
+from textual.widgets import Button, Link, Markdown, Static, TextArea
 
 from tests.support import ISSUE, jira_document, make_app, passing_checks
 from tests.test_status_projection import _seed_three_pr_session, _store
+
+# Tall enough for issue body (1fr) plus reject/post authorize controls.
+_RUN_TEST_SIZE = (100, 52)
 
 
 def _seed_jira_issue_session(tmp_path: Path) -> None:
@@ -48,22 +51,57 @@ def test_jira_issue_without_notes_opens_testing_notes_screen(tmp_path):
     tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             assert isinstance(tui.screen, TestingNotesScreen)
             link = tui.screen.query_one("#issue-link", Link)
             assert link.url == f"https://example.test/browse/{ISSUE}"
             desc = tui.screen.query_one("#description-md", Markdown).source
             assert "Fixture description body." in desc
-            notes_md = tui.screen.query_one("#testing-notes-md", Markdown).source
-            assert "No testing notes on the issue" in notes_md
+            assert "## Ticket description" in desc
+            assert "Testing notes assessment" in str(
+                tui.screen.query_one("#assessment-heading", Static).render()
+            )
+            assessment = tui.screen.query_one("#assessment-md", Markdown).source
+            assert "No testing notes were detected" in assessment
+            assert "Testing notes assessment" not in assessment
             accept = tui.screen.query_one("#accept-btn", Button)
-            assert accept.display is False
+            assert accept.display is True
             assert tui.screen.query_one("#reject-btn", Button).display is True
             session = read_json(tmp_path / "reviews" / ISSUE / "session.json")
             assert "testing_notes" not in (session.get("decisions") or {})
             acli_views = [call for call in runner.calls if call and call[0] == "acli" and "view" in call]
             assert len(acli_views) == 1
+
+    asyncio.run(_run())
+
+
+def test_ticket_panels_grow_when_terminal_grows_taller(tmp_path):
+    """Spare rows go to the issue panes; the accept/reject row stays one button tall."""
+    _seed_jira_issue_session(tmp_path)
+    app, _runner, world = make_app(tmp_path)
+    world.issue = jira_document(notes=None)
+    tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
+
+    async def _run() -> None:
+        async with tui.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            screen = tui.screen
+            short_description = screen.query_one("#description-scroll").region.height
+            short_assessment = screen.query_one("#assessment-scroll").region.height
+            short_row = screen.query_one("#decision-row").region.height
+
+            await pilot.resize_terminal(100, 70)
+            await pilot.pause()
+
+            tall_description = screen.query_one("#description-scroll").region.height
+            tall_assessment = screen.query_one("#assessment-scroll").region.height
+            dock = screen.query_one("#workflow-dock").region
+            assert tall_description >= short_description + 10
+            assert tall_assessment >= short_assessment + 10
+            assert screen.query_one("#decision-row").region.height == short_row == 3
+            # Dock sits on the footer, so the grown panes consumed the extra rows.
+            assert dock.bottom == screen.size.height - 1
 
     asyncio.run(_run())
 
@@ -75,7 +113,7 @@ def test_human_review_session_stays_on_status_screen(tmp_path):
     tui = ReviewTicketApp(store=store, issue=ISSUE, workflow_app=app, revise=False)
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             assert isinstance(tui.screen, StatusScreen)
             assert not [call for call in runner.calls if call and call[0] == "acli"]
@@ -98,7 +136,7 @@ def test_reject_save_writes_draft_and_decision(tmp_path):
     tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await pilot.click("#reject-btn")
             await pilot.pause()
@@ -130,7 +168,7 @@ def test_accept_advances_to_status_screen(tmp_path):
     tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             assert isinstance(tui.screen, TestingNotesScreen)
             await pilot.click("#accept-btn")
@@ -174,7 +212,7 @@ def test_post_approve_posts_comment_and_shows_transition(tmp_path):
     body = "Edited return body for post.\n"
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui, body)
             preview = tui.screen.query_one("#post-preview-md", Markdown).source
@@ -200,7 +238,7 @@ def test_post_deny_leaves_session_and_actions_unchanged(tmp_path):
     tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui)
             session_after_save = read_json(root / "session.json")
@@ -220,7 +258,7 @@ def test_second_post_approve_is_idempotent(tmp_path):
     tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui)
             await pilot.click("#post-approve-btn")
@@ -240,7 +278,7 @@ def test_transition_approve_returns_to_status_screen(tmp_path):
     tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui)
             await pilot.click("#post-approve-btn")
@@ -260,7 +298,7 @@ def test_transition_deny_does_not_transition(tmp_path):
     tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui)
             await pilot.click("#post-approve-btn")
@@ -281,7 +319,7 @@ def test_failed_post_shows_blocked_and_keeps_transition_hidden(tmp_path):
     tui = ReviewTicketApp(store=app.store, issue=ISSUE, workflow_app=app, revise=False)
 
     async def _run() -> None:
-        async with tui.run_test() as pilot:
+        async with tui.run_test(size=_RUN_TEST_SIZE) as pilot:
             await pilot.pause()
             await _save_reject_draft(pilot, tui)
             await pilot.click("#post-approve-btn")

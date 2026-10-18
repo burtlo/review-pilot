@@ -142,11 +142,8 @@ def run_review_attach(app: App, issue: str, *, revise: bool) -> StepResult:
         )
     issue = require_issue_key(issue)
     session_path = app.store.issue_dir(issue) / "session.json"
-    session = read_json(session_path)
-    if not session:
-        raise WorkflowError(
-            f"No review session exists for {issue}. Run `review-ticket {issue}` first."
-        )
+    if not read_json(session_path):
+        app.store.ensure_session(issue)
 
     from review_ticket.tui import ReviewTicketApp
 

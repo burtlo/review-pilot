@@ -22,23 +22,15 @@ from tests.support import (
 )
 
 
-def test_interactive_resume_shows_testing_notes_before_prompt(tmp_path):
+def test_interactive_resume_defers_testing_notes_to_attach(tmp_path):
     app, _runner, world = make_app(tmp_path)
     world.issue = jira_document("Ran the cart tests and recorded the result.")
-    prompts: list[str] = []
-
-    def _input(prompt: str) -> str:
-        prompts.append(prompt)
-        return "q"
-
     app.interactive = True
-    app.input_fn = _input
     result = resume(app, ISSUE)
     output = app.stdout.getvalue()
     assert result.outcome == Outcome.REVIEW_DECISION
-    assert "Ran the cart tests and recorded the result." in output
-    assert "## Testing notes" in output
-    assert prompts == ["Accept testing notes? [a]ccept / [r]eject / [q]uit: "]
+    assert f"next: review-ticket {ISSUE} attach" in output
+    assert "Accept testing notes?" not in output
 
 
 def test_multiple_discovered_prs_are_tracked_automatically(tmp_path):

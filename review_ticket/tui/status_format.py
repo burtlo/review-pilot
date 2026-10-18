@@ -29,19 +29,25 @@ def format_status_document(projection: StatusProjection) -> str:
 
 
 def format_pr_list_label(row: PrStatusRow) -> str:
-    """Single-line label for the PR picker (stored SHA and progress)."""
+    """One markdown line for the PR picker: linked ref, stored SHA, and progress."""
     short = short_sha(row.stored_sha) if row.stored_sha else "—"
-    return f"{row.owner}/{row.repo}#{row.number}  {short}  {row.progress.label}  {row.url}"
+    return f"{_pr_title(row)}  `{short}`  {row.progress.label}"
+
+
+def _pr_title(row: PrStatusRow) -> str:
+    title = f"{row.owner}/{row.repo}#{row.number}"
+    if row.url:
+        return f"[{title}]({row.url})"
+    return title
 
 
 def _format_pr_section(row: PrStatusRow) -> list[str]:
     short = short_sha(row.stored_sha) if row.stored_sha else "—"
     section = [
-        f"## {row.owner}/{row.repo}#{row.number}",
+        f"## {_pr_title(row)}",
         "",
         f"**Stored SHA:** `{short}`",
         f"**Review progress:** {row.progress.label}",
-        f"**Link:** {row.url}",
         "",
     ]
     if row.snapshot.stale and row.snapshot.open_sha:

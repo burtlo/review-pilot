@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import HorizontalGroup, Vertical, VerticalGroup, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Button, Footer, Header, Link, Markdown, TextArea
+from textual.widgets import Button, Footer, Header, Link, Markdown, Static, TextArea
 
 from review_ticket.models import Outcome
-from review_ticket.reports import return_comment
+from review_ticket.reports import return_comment, testing_notes_assessment_markdown
 from review_ticket.storage import read_json
+from review_ticket.textutil import format_jira_body_markdown, issue_section_markdown
 from review_ticket.util import fingerprint, sha256_text
 from review_ticket.workflow import decide_notes, get_decision, jira_comment, jira_transition, refresh_issue
 
@@ -33,7 +34,89 @@ def should_auto_present_testing_notes(session: dict[str, Any]) -> bool:
 class TestingNotesScreen(Screen[None]):
     """Refresh Jira issue fields; record testing-notes accept/reject decisions."""
 
-    BINDINGS = [("escape", "go_back", "Back")]
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("shift+tab", "focus_issue_link", "Jira link"),
+    ]
+
+    CSS = """
+    /* https://textual.textualize.io/how-to/design-a-layout/ — dock chrome, 1fr body */
+    TestingNotesScreen {
+        layout: vertical;
+        overflow: hidden;
+    }
+    TestingNotesScreen Header {
+        dock: top;
+        height: auto;
+    }
+    TestingNotesScreen Footer {
+        dock: bottom;
+        height: auto;
+    }
+    TestingNotesScreen #screen-fill {
+        width: 1fr;
+        height: 1fr;
+        layout: vertical;
+        overflow: hidden;
+        min-height: 0;
+    }
+    TestingNotesScreen #issue-link {
+        height: auto;
+        margin: 0 1;
+    }
+    TestingNotesScreen #ticket-panels {
+        height: 1fr;
+        min-height: 18;
+        layout: vertical;
+        overflow: hidden;
+    }
+    TestingNotesScreen #description-scroll {
+        height: 1fr;
+        min-height: 8;
+        margin: 0 1;
+        border: tall $panel;
+        background: $surface;
+    }
+    TestingNotesScreen #assessment-scroll {
+        height: 1fr;
+        min-height: 8;
+        margin: 0 1 1 1;
+        border: tall $panel;
+        background: $surface;
+    }
+    TestingNotesScreen #assessment-heading {
+        height: auto;
+        margin: 0 1 0 1;
+        text-style: bold;
+        color: $text;
+    }
+    TestingNotesScreen #workflow-dock {
+        width: 1fr;
+        height: auto;
+        background: $background;
+        border-top: tall $primary-darken-2;
+        padding: 0 1 1 1;
+    }
+    /* Horizontal defaults to height: 1fr and would stretch this dock into the
+       spare rows, leaving a blank band under the buttons. */
+    TestingNotesScreen #workflow-dock HorizontalGroup {
+        width: 1fr;
+        height: auto;
+    }
+    TestingNotesScreen #return-draft {
+        height: auto;
+        min-height: 6;
+        max-height: 12;
+    }
+    TestingNotesScreen .issue-body-md {
+        width: 1fr;
+        height: auto;
+        padding: 0 1;
+    }
+    TestingNotesScreen .issue-body-md MarkdownBlock {
+        text-wrap: wrap;
+    }
+    """
 
     def __init__(self, store: Store, issue: str, workflow_app: WorkflowApp) -> None:
         super().__init__()
@@ -43,9 +126,9 @@ class TestingNotesScreen(Screen[None]):
         self._issue_data: dict[str, Any] = {}
 
     def on_mount(self) -> None:
-        self.query_one("#reject-panel", Vertical).display = False
-        self.query_one("#post-panel", Vertical).display = False
-        self.query_one("#transition-panel", Vertical).display = False
+        self.query_one("#reject-panel", VerticalGroup).display = False
+        self.query_one("#post-panel", VerticalGroup).display = False
+        self.query_one("#transition-panel", VerticalGroup).display = False
         session = read_json(self._store.issue_dir(self._issue) / "session.json") or {}
         self._issue_data = refresh_issue(self._workflow_app, session)
         url = str(self._issue_data.get("url") or "")
@@ -55,14 +138,12 @@ class TestingNotesScreen(Screen[None]):
             link.url = url
         link.update(summary)
         description = self._issue_data.get("description") or ""
-        testing_notes = self._issue_data.get("testing_notes") or ""
-        self.query_one("#description-md", Markdown).update(description or "_(No description.)_")
-        self.query_one("#testing-notes-md", Markdown).update(
-            testing_notes or "_(No testing notes on the issue.)_"
+        self.query_one("#description-md", Markdown).update(
+            issue_section_markdown("Ticket description", description, empty_placeholder="_(No description.)_")
         )
-        accept_btn = self.query_one("#accept-btn", Button)
-        if not str(testing_notes).strip():
-            accept_btn.display = False
+        self.query_one("#assessment-md", Markdown).update(
+            testing_notes_assessment_markdown(self._issue_data)
+        )
         decision = get_decision(session, "testing_notes")
         revise = bool(getattr(self.app, "revise", False))
         if decision is not None and not revise:
@@ -72,31 +153,39 @@ class TestingNotesScreen(Screen[None]):
                 self._sync_authorize_panels()
         elif decision is not None and revise:
             self._set_decision_buttons_enabled(True)
+        self.query_one("#description-scroll", VerticalScroll).focus()
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Link(self._issue, id="issue-link")
-        with VerticalScroll(id="description-scroll"):
-            yield Markdown("", id="description-md")
-        with VerticalScroll(id="testing-notes-scroll"):
-            yield Markdown("", id="testing-notes-md")
-        with Horizontal(id="decision-row"):
-            yield Button("Accept", id="accept-btn", variant="success")
-            yield Button("Reject", id="reject-btn", variant="error")
-        with Vertical(id="reject-panel", classes="reject-panel"):
-            yield TextArea("", id="return-draft")
-            yield Button("Save", id="save-btn", variant="primary")
-        with Vertical(id="post-panel"):
-            yield Markdown("", id="post-preview-md")
-            with Horizontal(id="post-actions"):
-                yield Button("Approve", id="post-approve-btn", variant="success")
-                yield Button("Deny", id="post-deny-btn")
-        with Vertical(id="transition-panel"):
-            yield Markdown("", id="transition-preview-md")
-            with Horizontal(id="transition-actions"):
-                yield Button("Approve", id="transition-approve-btn", variant="success")
-                yield Button("Deny", id="transition-deny-btn")
-        yield Footer()
+        yield Footer(show_command_palette=False)
+        with Vertical(id="screen-fill"):
+            yield Link(self._issue, id="issue-link")
+            with Vertical(id="ticket-panels"):
+                with VerticalScroll(id="description-scroll"):
+                    yield Markdown("", id="description-md", classes="issue-body-md")
+                yield Static("Testing notes assessment", id="assessment-heading")
+                with VerticalScroll(id="assessment-scroll"):
+                    yield Markdown("", id="assessment-md", classes="issue-body-md")
+            with VerticalGroup(id="workflow-dock"):
+                with HorizontalGroup(id="decision-row"):
+                    yield Button("Accept", id="accept-btn", variant="success")
+                    yield Button("Reject", id="reject-btn", variant="error")
+                with VerticalGroup(id="reject-panel", classes="reject-panel"):
+                    yield TextArea("", id="return-draft")
+                    yield Button("Save", id="save-btn", variant="primary")
+                with VerticalGroup(id="post-panel"):
+                    yield Markdown("", id="post-preview-md")
+                    with HorizontalGroup(id="post-actions"):
+                        yield Button("Approve", id="post-approve-btn", variant="success")
+                        yield Button("Deny", id="post-deny-btn")
+                with VerticalGroup(id="transition-panel"):
+                    yield Markdown("", id="transition-preview-md")
+                    with HorizontalGroup(id="transition-actions"):
+                        yield Button("Approve", id="transition-approve-btn", variant="success")
+                        yield Button("Deny", id="transition-deny-btn")
+
+    def action_focus_issue_link(self) -> None:
+        self.query_one("#issue-link", Link).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "accept-btn":
@@ -137,8 +226,12 @@ class TestingNotesScreen(Screen[None]):
             return path.read_text(encoding="utf-8")
         return self._draft_prefill()
 
+    def _set_ticket_panels_visible(self, visible: bool) -> None:
+        self.query_one("#ticket-panels", Vertical).display = visible
+
     def _show_reject_panel(self, *, prefill: str, focus: bool) -> None:
-        panel = self.query_one("#reject-panel", Vertical)
+        self._set_ticket_panels_visible(not focus)
+        panel = self.query_one("#reject-panel", VerticalGroup)
         panel.display = True
         draft = self.query_one("#return-draft", TextArea)
         draft.disabled = False
@@ -186,7 +279,8 @@ class TestingNotesScreen(Screen[None]):
         return self._store.successful_action(self._issue, self._transition_action_key(status)) is not None
 
     def _comment_preview(self, text: str) -> str:
-        return f"Comment on {self._issue}.\n\n{text.rstrip()}\n"
+        body = format_jira_body_markdown(text).strip() or text.rstrip()
+        return f"Comment on {self._issue}.\n\n{body}\n"
 
     def _transition_preview(self, status: str) -> str:
         session = self._session()
@@ -212,15 +306,17 @@ class TestingNotesScreen(Screen[None]):
 
     def _show_post_panel(self) -> None:
         text = self._read_return_draft()
+        self._set_ticket_panels_visible(False)
         self.query_one("#post-preview-md", Markdown).update(self._comment_preview(text))
-        self.query_one("#post-panel", Vertical).display = True
-        self.query_one("#transition-panel", Vertical).display = False
+        self.query_one("#post-panel", VerticalGroup).display = True
+        self.query_one("#transition-panel", VerticalGroup).display = False
 
     def _show_transition_panel(self) -> None:
         status = self._in_progress_status()
+        self._set_ticket_panels_visible(False)
         self.query_one("#transition-preview-md", Markdown).update(self._transition_preview(status))
-        self.query_one("#post-panel", Vertical).display = False
-        self.query_one("#transition-panel", Vertical).display = True
+        self.query_one("#post-panel", VerticalGroup).display = False
+        self.query_one("#transition-panel", VerticalGroup).display = True
 
     def _on_post_approve(self) -> None:
         body_file = self._return_draft_path()
@@ -240,7 +336,7 @@ class TestingNotesScreen(Screen[None]):
         self._show_transition_panel()
 
     def _on_post_deny(self) -> None:
-        self.query_one("#post-panel", Vertical).display = False
+        self.query_one("#post-panel", VerticalGroup).display = False
         draft = self.query_one("#return-draft", TextArea)
         draft.disabled = False
 

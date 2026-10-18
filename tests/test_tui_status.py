@@ -63,6 +63,35 @@ def test_status_screen_renders_three_pr_fixture(tmp_path):
             assert "No snapshot" in text
             pr_list = app.screen.query_one("#pr-list")
             assert len(list(pr_list.children)) == 3
+            row = pr_list.children[0].query_one(Markdown).source
+            assert row.startswith("[acme/widgets#87](https://github.com/acme/widgets/pull/87)")
+            assert row.count("https://github.com/acme/widgets/pull/87") == 1
+            assert "**Link:**" not in text
+
+    asyncio.run(_run())
+
+
+def test_pr_picker_stays_on_the_footer_when_terminal_grows(tmp_path):
+    _seed_three_pr_session(tmp_path)
+    store = _store(tmp_path)
+    app = ReviewTicketApp(store=store, issue=ISSUE)
+
+    async def _run() -> None:
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            short_checks = screen.query_one("#status-scroll").region.height
+            short_picker = screen.query_one("#pr-panel").region.height
+
+            await pilot.resize_terminal(100, 70)
+            await pilot.pause()
+
+            tall_checks = screen.query_one("#status-scroll").region.height
+            picker = screen.query_one("#pr-panel").region
+            assert tall_checks >= short_checks + 20
+            assert picker.height == short_picker
+            assert picker.height <= 12
+            assert picker.bottom == screen.size.height - 1
 
     asyncio.run(_run())
 

@@ -83,11 +83,7 @@ class PrReviewScreen(Screen[None]):
         yield Header()
         yield Static("", id="pr-header")
         yield Static("", id="stale-banner", classes="stale-banner")
-        yield Static(
-            "There is no automated review for this commit. "
-            "Run run-review for this SHA outside attach when you are ready to triage.",
-            id="empty-state",
-        )
+        yield Static("", id="empty-state")
         with Vertical(id="review-body"):
             yield ListView(id="finding-list")
             with VerticalScroll(id="detail-scroll"):
@@ -204,6 +200,16 @@ class PrReviewScreen(Screen[None]):
             body.display = True
             action_bar.display = True
         else:
+            ref = f"{self.owner}/{self.repo}#{self.number}"
+            empty.update(
+                "There is no automated review for this pull request at the stored commit.\n\n"
+                "`run-review` runs once per PR (readiness already ran for all tracked PRs). "
+                "From a terminal:\n\n"
+                f"  review-ticket {self.issue} pr select {ref}\n"
+                f"  review-ticket {self.issue} run-review\n\n"
+                "Re-open attach and select this PR to triage findings. "
+                "Repeat for each PR before `publish-review` (switch with `pr select` each time)."
+            )
             empty.display = True
             body.display = False
             action_bar.display = False

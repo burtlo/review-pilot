@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from textual.app import ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Footer, Header, Label, ListItem, ListView, Markdown
+from textual.widgets import Footer, Header, ListItem, ListView, Markdown
 
 from review_ticket.storage import Store
 from review_ticket.status_projection import PrStatusRow, StatusProjection, project_review_status
@@ -17,6 +17,53 @@ class StatusScreen(Screen[None]):
     """Read-only session status; PR rows open the review screen without writing session."""
 
     BINDINGS = [("q", "quit_status", "Quit")]
+
+    CSS = """
+    StatusScreen {
+        layout: vertical;
+        overflow: hidden;
+    }
+    StatusScreen Header {
+        dock: top;
+        height: auto;
+    }
+    StatusScreen Footer {
+        dock: bottom;
+        height: auto;
+    }
+    StatusScreen #screen-fill {
+        width: 1fr;
+        height: 1fr;
+        layout: vertical;
+        overflow: hidden;
+    }
+    StatusScreen #status-scroll {
+        height: 1fr;
+        min-height: 0;
+    }
+    StatusScreen #pr-panel {
+        height: auto;
+        max-height: 30%;
+        margin: 0 1 0 1;
+        border: tall $panel;
+        background: $surface;
+        overflow: hidden;
+    }
+    /* ListView defaults to height: 1fr and would leave an empty band under the rows. */
+    StatusScreen #pr-list {
+        height: auto;
+        max-height: 8;
+        background: $surface;
+    }
+    StatusScreen #pr-list Markdown {
+        height: auto;
+        margin: 0;
+        padding: 0 1;
+    }
+    StatusScreen #pr-list Markdown > MarkdownParagraph {
+        margin: 0;
+    }
+    """
 
     def __init__(self, store: Store, issue: str) -> None:
         super().__init__()
@@ -43,22 +90,25 @@ class StatusScreen(Screen[None]):
         self.query_one("#status-doc", Markdown).update(format_status_document(self._projection))
         list_view = self.query_one("#pr-list", ListView)
         labels = [format_pr_list_label(row) for row in self._pr_rows]
+        self.query_one("#pr-panel", Vertical).display = bool(labels)
         children = list(list_view.children)
         if len(children) != len(labels):
             list_view.clear()
             if labels:
-                list_view.mount(*[ListItem(Label(text)) for text in labels])
+                list_view.mount(*[ListItem(Markdown(text)) for text in labels])
                 list_view.index = 0
         else:
             for child, text in zip(children, labels, strict=True):
-                child.query_one(Label).update(text)
+                child.query_one(Markdown).update(text)
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with VerticalScroll(id="status-scroll"):
-            yield Markdown("", id="status-doc")
-        yield ListView(id="pr-list")
         yield Footer()
+        with Vertical(id="screen-fill"):
+            with VerticalScroll(id="status-scroll"):
+                yield Markdown("", id="status-doc")
+            with Vertical(id="pr-panel"):
+                yield ListView(id="pr-list")
 
     def action_quit_status(self) -> None:
         self.app.exit()

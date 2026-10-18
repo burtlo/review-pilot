@@ -60,6 +60,64 @@ def test_testing_notes_from_custom_field_adf():
     assert textutil.testing_notes_from_fields(fields, "") == "Ran review-ticket locally."
 
 
+def test_adf_to_markdown_headings_and_lists():
+    doc = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Acceptance Criteria"}],
+            },
+            {
+                "type": "bulletList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "Ship safely"}],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "See "},
+                    {"type": "text", "text": "docs", "marks": [{"type": "link", "attrs": {"href": "https://example.test"}}]},
+                ],
+            },
+        ],
+    }
+    md = textutil.adf_to_markdown(doc)
+    assert "## Acceptance Criteria" in md
+    assert "- Ship safely" in md
+    assert "[docs](https://example.test)" in md
+
+
+def test_testing_notes_assessment_markdown_empty():
+    from review_ticket.reports import testing_notes_assessment_markdown
+
+    md = testing_notes_assessment_markdown(
+        {"key": "X-1", "status": "Ready", "testing_notes": "", "acceptance_criteria": "Must pass."}
+    )
+    assert "No testing notes were detected" in md
+    assert "**Accept**" in md
+    assert "## Acceptance criteria" in md
+    assert "Must pass." in md
+
+
+def test_format_jira_body_markdown_plain_headings():
+    plain = "Acceptance Criteria\nShip safely\n\nTesting Notes\nRan locally."
+    md = textutil.format_jira_body_markdown(plain)
+    assert "## Acceptance Criteria" in md
+    assert "## Testing Notes" in md
+    assert "Ship safely" in md
+
+
 def test_github_pr_search_query_org_and_user():
     org = config_from_mapping({"github_org": "acme-corp"}, cwd=Path("."))
     assert github_pr_search_query(org, "HIV-1") == "HIV-1 org:acme-corp"

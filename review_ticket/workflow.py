@@ -65,7 +65,6 @@ from review_ticket.reports import (
     readiness_report,
     summarize_checks,
     summarize_findings,
-    testing_notes_decision_preview,
     return_comment,
     reviewer_prompt,
     review_preview,
@@ -1179,17 +1178,6 @@ def step_jira(app: App, session: dict[str, Any]) -> StepResult | None:
         decision = None
         app.store.save_session(session)
     report = str(app.store.issue_dir(issue) / "issue-report.md")
-    if decision is None and app.interactive and notes.strip():
-        preview = testing_notes_decision_preview(normalized, report_path=report)
-        prompted = _prompt_notes(app, preview)
-        if prompted:
-            put_decision(
-                session,
-                "testing_notes",
-                {"choice": prompted, "notes": "", "notes_hash": notes_hash, "at": iso_now()},
-            )
-            app.store.save_session(session)
-            decision = get_decision(session, "testing_notes")
     if decision is None:
         if not notes.strip():
             draft = _write_return_draft(
@@ -1204,14 +1192,14 @@ def step_jira(app: App, session: dict[str, Any]) -> StepResult | None:
                 outcome=Outcome.ACTION_REQUIRED,
                 summary="Testing notes are missing. The default recommendation is to return the issue.",
                 recommendation=app.config.in_progress_status,
-                next_command=f"review-ticket {issue} notes --reject",
+                next_command=f"review-ticket {issue} attach",
                 report_path=str(draft),
             )
         return StepResult(
             step="jira-issue",
             outcome=Outcome.REVIEW_DECISION,
             summary="Testing notes are ready for a reviewer decision.",
-            next_command=f"review-ticket {issue} notes --accept",
+            next_command=f"review-ticket {issue} attach",
             report_path=report,
             details={"testing_notes": notes},
         )
@@ -2772,17 +2760,6 @@ def _journal(
 
 def _blocked(step: str, message: str) -> StepResult:
     return StepResult(step=step, outcome=Outcome.BLOCKED, summary=message, recommendation=None)
-
-
-def _prompt_notes(app: App, preview: str) -> str | None:
-    app.write(preview.rstrip() + "\n\n")
-    reader = app.input_fn or input
-    answer = reader("Accept testing notes? [a]ccept / [r]eject / [q]uit: ").strip().lower()
-    if answer in {"a", "accept"}:
-        return "accept"
-    if answer in {"r", "reject"}:
-        return "reject"
-    return None
 
 
 def _jira_url(app: App, issue: str) -> str:

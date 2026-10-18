@@ -12,6 +12,7 @@ from review_ticket.config import Config
 from review_ticket.models import ToolError
 from review_ticket.runner import CommandResult, Runner
 from review_ticket.textutil import (
+    adf_to_markdown,
     adf_to_text,
     extract_section,
     normalize_comments,
@@ -140,7 +141,7 @@ def normalize_issue(issue: str, view: Any, comments_payload: Any, config: Config
     fields = document.get("fields") if isinstance(document.get("fields"), dict) else document
     if not isinstance(fields, dict):
         raise ToolError("acli returned a Jira payload that is not an object.")
-    description = adf_to_text(fields.get("description")).strip()
+    description = adf_to_markdown(fields.get("description")).strip()
     status = fields.get("status")
     if isinstance(status, dict):
         status_name = str(status.get("name") or "")

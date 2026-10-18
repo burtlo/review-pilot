@@ -107,7 +107,7 @@ def test_multi_pr_analyzer_report_lists_every_pull_request():
                 "checks_summary": "all 1 required check(s) passed",
                 "findings_summary": "no Bugbot or CodeQL threads",
                 "readiness_summary": "Required checks passed.",
-                "checks_table": "| Check | Required | Status | State | Link |\n| --- | --- | --- | --- | --- |",
+                "checks_table": "| Check | Required | Status | State |\n| --- | --- | --- | --- |",
                 "detail_markdown": "_No Bugbot or CodeQL findings were collected._",
             },
             {
@@ -117,7 +117,7 @@ def test_multi_pr_analyzer_report_lists_every_pull_request():
                 "checks_summary": "all 1 required check(s) passed",
                 "findings_summary": "2 dispositioned",
                 "readiness_summary": "Required checks passed.",
-                "checks_table": "| Check | Required | Status | State | Link |\n| --- | --- | --- | --- | --- |",
+                "checks_table": "| Check | Required | Status | State |\n| --- | --- | --- | --- |",
                 "detail_markdown": "## bugbot:1 (bugbot, dispositioned)",
             },
         ]

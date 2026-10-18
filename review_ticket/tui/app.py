@@ -14,6 +14,7 @@ class ReviewTicketApp(App[None]):
     """Root Textual app; attach wiring lands in P7."""
 
     TITLE = "review-ticket"
+    ENABLE_COMMAND_PALETTE = False
 
     def __init__(
         self,
