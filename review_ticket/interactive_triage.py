@@ -52,16 +52,10 @@ class TriageState:
         return all(item.decision in {"accept", "reject"} for item in self.findings)
 
 
-def load_triage_state(app: App, issue: str) -> tuple[TriageState, dict[str, Any], str, tuple[str, str, int]]:
-    issue = require_issue_key(issue)
-    session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
-    review_dir = _review_dir(app, issue, identity, sha)
-    document = read_json(review_dir / "findings.json")
-    if not document:
-        raise WorkflowError("No automated findings are stored. Run run-review or import-review first.")
-    existing = read_json(review_dir / "human-review.json") or {}
+def _triage_state_from_review_files(
+    document: dict[str, Any],
+    existing: dict[str, Any],
+) -> TriageState:
     prior = (existing.get("findings") or {}) if isinstance(existing.get("findings"), dict) else {}
     rows: list[FindingState] = []
     for finding in document.get("findings") or []:
@@ -88,13 +82,36 @@ def load_triage_state(app: App, issue: str) -> tuple[TriageState, dict[str, Any]
                 explanation=explanation,
             )
         )
-    state = TriageState(
+    return TriageState(
         findings=rows,
         summary=str(existing.get("summary") or document.get("summary") or ""),
         event=existing.get("event"),
         rejected_review=bool(existing.get("rejected_review")),
     )
-    return state, document, sha, identity
+
+
+def load_triage_state(
+    app: App,
+    issue: str,
+    *,
+    identity: tuple[str, str, int] | None = None,
+    sha: str | None = None,
+) -> tuple[TriageState, dict[str, Any], str, tuple[str, str, int]]:
+    issue = require_issue_key(issue)
+    if identity is None or sha is None:
+        session = _require_review_session(app, issue)
+        resolved_identity = _require_identity(session)
+        resolved_sha = session["active_sha"]
+    else:
+        resolved_identity = identity
+        resolved_sha = sha
+    review_dir = _review_dir(app, issue, resolved_identity, resolved_sha)
+    document = read_json(review_dir / "findings.json")
+    if not document:
+        raise WorkflowError("No automated findings are stored. Run run-review or import-review first.")
+    existing = read_json(review_dir / "human-review.json") or {}
+    state = _triage_state_from_review_files(document, existing)
+    return state, document, resolved_sha, resolved_identity
 
 
 def publish_preview_counts(
@@ -197,7 +214,7 @@ def _prompt(app: App, message: str) -> str:
     return input()
 
 
-def _select_finding(state: TriageState, token: str) -> FindingState:
+def select_finding(state: TriageState, token: str) -> FindingState:
     if token.isdigit():
         index = int(token)
         if 1 <= index <= len(state.findings):
@@ -206,6 +223,62 @@ def _select_finding(state: TriageState, token: str) -> FindingState:
         if item.finding_id == token:
             return item
     raise WorkflowError(f"Unknown finding {token!r}. Use a list number or finding id.")
+
+
+def _require_open_review(state: TriageState) -> None:
+    if state.rejected_review:
+        raise WorkflowError("Automated review is rejected. Save with w or quit with q.")
+
+
+def accept_finding(state: TriageState, token: str) -> None:
+    _require_open_review(state)
+    select_finding(state, token).decision = "accept"
+
+
+def reject_finding(state: TriageState, token: str) -> None:
+    _require_open_review(state)
+    select_finding(state, token).decision = "reject"
+
+
+def toggle_must_fix(state: TriageState, token: str) -> None:
+    _require_open_review(state)
+    target = select_finding(state, token)
+    target.must_fix = not target.effective_must_fix
+
+
+def set_finding_explanation(state: TriageState, token: str, explanation: str) -> None:
+    _require_open_review(state)
+    target = select_finding(state, token)
+    if explanation.strip():
+        target.explanation = explanation.rstrip("\n")
+
+
+def set_summary(state: TriageState, summary: str) -> None:
+    state.summary = summary.strip()
+
+
+def set_event(state: TriageState, event: str | None) -> None:
+    if event is None or not str(event).strip():
+        state.event = None
+        return
+    text = str(event).strip().upper()
+    if text in {"COMMENT", "APPROVE", "REQUEST_CHANGES"}:
+        state.event = text
+        return
+    raise WorkflowError("event must be COMMENT, APPROVE, or REQUEST_CHANGES.")
+
+
+def reject_automated_review(state: TriageState) -> None:
+    state.rejected_review = True
+    state.findings = []
+
+
+def triage_document_if_ready(state: TriageState) -> dict[str, Any]:
+    if not state.all_decided():
+        raise WorkflowError(
+            "Decide every finding (accept or reject) before saving, or reject the automated review."
+        )
+    return human_document_from_state(state)
 
 
 def preview_counts_from_state(
@@ -254,96 +327,48 @@ def process_triage_command(
     if cmd == "q":
         return "quit"
     if cmd == "w":
-        if not state.all_decided():
-            raise WorkflowError("Decide every finding (accept or reject) before saving, or reject the automated review.")
-        return human_document_from_state(state)
+        return triage_document_if_ready(state)
     if cmd == "x":
-        state.rejected_review = True
-        state.findings = []
+        reject_automated_review(state)
         return None
     if state.rejected_review and cmd not in {"w", "q", "s", "v"}:
-        raise WorkflowError("Automated review is rejected. Save with w or quit with q.")
+        _require_open_review(state)
 
     if cmd == "s":
-        text = prompt("summary: ")
-        state.summary = text.strip()
+        set_summary(state, prompt("summary: "))
         return None
     if cmd == "v":
-        text = prompt("event (COMMENT, APPROVE, REQUEST_CHANGES, or blank for auto): ").strip().upper()
-        if not text:
-            state.event = None
-        elif text in {"COMMENT", "APPROVE", "REQUEST_CHANGES"}:
-            state.event = text
-        else:
-            raise WorkflowError("event must be COMMENT, APPROVE, or REQUEST_CHANGES.")
+        text = prompt("event (COMMENT, APPROVE, REQUEST_CHANGES, or blank for auto): ")
+        set_event(state, text if text.strip() else None)
         return None
 
     if cmd in {"t", "f", "e"}:
         if not arg:
             raise WorkflowError(f"Command {cmd} needs a finding number or id.")
-        target = _select_finding(state, arg)
         if cmd == "t":
+            target = select_finding(state, arg)
             if target.decision == "accept":
-                target.decision = "reject"
+                reject_finding(state, arg)
             elif target.decision == "reject":
-                target.decision = "accept"
+                accept_finding(state, arg)
             else:
-                target.decision = "accept"
+                accept_finding(state, arg)
             return None
         if cmd == "f":
-            target.must_fix = not target.effective_must_fix
+            toggle_must_fix(state, arg)
             return None
+        target = select_finding(state, arg)
         write(f"current explanation for {target.finding_id}:\n{target.effective_explanation}\n")
-        text = prompt("new explanation (blank keeps current): ")
-        if text.strip():
-            target.explanation = text.rstrip("\n")
+        set_finding_explanation(state, arg, prompt("new explanation (blank keeps current): "))
         return None
 
     if cmd.isdigit():
-        item = _select_finding(state, cmd)
+        item = select_finding(state, cmd)
         write(f"selected {item.finding_id}: {item.title}\n")
         write("  subcommands: t <n> toggle | f <n> must-fix | e <n> explanation\n")
         return None
 
     raise WorkflowError(f"Unknown command {cmd!r}.")
-
-
-def run_interactive_triage(app: App, issue: str, *, revise: bool) -> dict[str, Any]:
-    if not app.interactive:
-        raise WorkflowError(
-            "review interactive requires an interactive terminal (TTY). "
-            "Use `review apply --file` or review apply flags instead."
-        )
-    issue = require_issue_key(issue)
-    session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
-    review_dir = _review_dir(app, issue, identity, sha)
-    existing = read_json(review_dir / "human-review.json")
-    if existing and not revise:
-        raise WorkflowError("A human review is already recorded. Pass --revise to replace it.")
-
-    state, document, _sha, _identity = load_triage_state(app, issue)
-    diff_index = _diff_index(app, issue, identity, sha)
-    write = app.write
-    prompt = lambda message: _prompt(app, message)
-
-    while True:
-        inline, summary_only = preview_counts_from_state(state, document, diff_index)
-        _render(state, inline=inline, summary_only=summary_only, write=write)
-        line = prompt("> ")
-        result = process_triage_command(
-            state,
-            line,
-            document=document,
-            diff_index=diff_index,
-            prompt=prompt,
-            write=write,
-        )
-        if result == "quit":
-            raise WorkflowError("Interactive triage cancelled.")
-        if isinstance(result, dict):
-            return result
 
 
 def proposed_payload_from_human(

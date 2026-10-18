@@ -13,7 +13,6 @@ from review_ticket.models import AuthorizationDenied, Outcome, StepResult, Workf
 from review_ticket.runner import Runner, SubprocessRunner
 from review_ticket.storage import read_json
 from review_ticket.util import require_issue_key
-from review_ticket.interactive_triage import run_interactive_triage
 from review_ticket.workflow import (
     App,
     apply_review,
@@ -100,6 +99,8 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
         return run_review(app, issue, revise=args.revise)
     if command == "import-review":
         return import_review(app, issue, Path(args.file), revise=args.revise)
+    if command == "attach":
+        return run_review_attach(app, issue, revise=args.revise)
     if command == "review":
         return _review(app, issue, args)
     if command == "publish-review":
@@ -133,12 +134,38 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
     raise WorkflowError(f"Unknown command {command}.")
 
 
+def run_review_attach(app: App, issue: str, *, revise: bool) -> StepResult:
+    if not app.interactive:
+        raise WorkflowError(
+            "attach requires an interactive terminal (TTY). "
+            "Use `notes`, `jira comment`, `jira transition`, or `review apply --file` instead."
+        )
+    issue = require_issue_key(issue)
+    session_path = app.store.issue_dir(issue) / "session.json"
+    session = read_json(session_path)
+    if not session:
+        raise WorkflowError(
+            f"No review session exists for {issue}. Run `review-ticket {issue}` first."
+        )
+
+    from review_ticket.tui import ReviewTicketApp
+
+    ReviewTicketApp(
+        store=app.store,
+        issue=issue,
+        workflow_app=app,
+        revise=revise,
+    ).run()
+    return StepResult(
+        step="human-review",
+        outcome=Outcome.COMPLETE,
+        summary="Review attach session closed.",
+    )
+
+
 def _review(app: App, issue: str, args: argparse.Namespace) -> StepResult:
     if args.review_cmd == "show":
         return show_status(app, issue)
-    if args.review_cmd == "interactive":
-        human = run_interactive_triage(app, issue, revise=args.revise)
-        return apply_review(app, issue, human, revise=args.revise)
     if args.file and (args.accept_all or args.finding or args.reject_automated):
         raise WorkflowError("Use either --file or the individual review flags, not both.")
     if args.file:
@@ -324,6 +351,9 @@ def build_parser() -> argparse.ArgumentParser:
     imported.add_argument("--file", required=True)
     imported.add_argument("--revise", action="store_true")
 
+    attach = sub.add_parser("attach", help="Open the Textual review UI")
+    attach.add_argument("--revise", action="store_true")
+
     review = sub.add_parser("review", help="Inspect or record the human review")
     review_sub = review.add_subparsers(dest="review_cmd", required=True)
     review_sub.add_parser("show")
@@ -338,11 +368,6 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument("--summary")
     apply_parser.add_argument("--reject-automated", action="store_true")
     apply_parser.add_argument("--revise", action="store_true")
-    interactive_parser = review_sub.add_parser(
-        "interactive",
-        help="Interactively accept or reject findings and save the human review",
-    )
-    interactive_parser.add_argument("--revise", action="store_true")
 
     publish = sub.add_parser("publish-review", help="Publish the approved local review to GitHub")
     publish.add_argument("--yes", action="store_true")

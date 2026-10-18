@@ -305,7 +305,7 @@ def review_preview(
             lines.append("")
             lines.append(
                 "_Counts assume all findings are accepted until you record a human review "
-                "(`review apply` or `review interactive`)._"
+                "(`review apply` or `review-ticket <issue> attach`)._"
             )
         lines.append("")
     lines.extend(["## Findings", ""])
@@ -352,10 +352,11 @@ def review_preview(
             lines.append("")
     lines.extend(
         [
-            "## File-based triage",
+            "## Triage",
             "",
-            "Without the interactive TUI, edit decisions in `human-review.json` and run "
-            "`review apply --file human-review.json`, or use `review apply` flags. "
+            "Run `review-ticket <issue> attach` when you have a TTY. Otherwise edit decisions in "
+            "`human-review.json` and run `review apply --file human-review.json`, or use "
+            "`review apply` flags. "
             "`reviewer-report.md` is the automated reviewer narrative; this file focuses on "
             "publish placement and triage status.",
             "",

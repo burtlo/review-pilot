@@ -57,7 +57,7 @@ def test_import_review_after_unset_reviewer_handoff(tmp_path):
     output = app.stdout.getvalue()
     assert code == 0
     assert (review / "findings.json").is_file()
-    assert f"next: review-ticket {ISSUE} review interactive" in output
+    assert f"next: review-ticket {ISSUE} attach" in output
     stored = read_json(review / "findings.json")
     assert stored["findings"][0]["title"] == "Missing validation"
 

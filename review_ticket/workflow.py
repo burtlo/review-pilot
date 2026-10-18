@@ -237,7 +237,15 @@ def show_status(app: App, issue: str) -> StepResult:
     return result
 
 
-def decide_notes(app: App, issue: str, choice: str, notes: str, *, revise: bool) -> StepResult:
+def decide_notes(
+    app: App,
+    issue: str,
+    choice: str,
+    notes: str,
+    *,
+    revise: bool,
+    draft_body: str | None = None,
+) -> StepResult:
     issue = require_issue_key(issue)
     if choice not in {"accept", "reject"}:
         raise WorkflowError("Testing-note decision must be accept or reject.")
@@ -252,13 +260,18 @@ def decide_notes(app: App, issue: str, choice: str, notes: str, *, revise: bool)
     put_decision(session, "testing_notes", value, revise=revise)
     _append_note(app, issue, notes)
     if choice == "reject":
-        draft = _write_return_draft(
-            app,
-            issue,
-            reason="The testing notes are missing or not adequate for peer review.",
-            notes=notes,
-            links=[],
-        )
+        if draft_body is not None:
+            draft_path = app.store.issue_dir(issue) / "return-comment.md"
+            write_text(draft_path, draft_body)
+            draft = draft_path
+        else:
+            draft = _write_return_draft(
+                app,
+                issue,
+                reason="The testing notes are missing or not adequate for peer review.",
+                notes=notes,
+                links=[],
+            )
         session["return_draft"] = str(draft)
     app.store.save_session(session)
     return resume(app, issue)
@@ -415,15 +428,17 @@ def import_review(app: App, issue: str, file: Path, *, revise: bool) -> StepResu
     return finish(app, session, _execute_reviewer(app, session, revise=revise, imported=payload))
 
 
-def apply_review(app: App, issue: str, human: dict[str, Any], *, revise: bool) -> StepResult:
-    issue = require_issue_key(issue)
-    session = _require_review_session(app, issue)
-    identity = _require_identity(session)
-    sha = session["active_sha"]
+def _persist_human_review_files(
+    app: App,
+    issue: str,
+    identity: tuple[str, str, int],
+    sha: str,
+    human: dict[str, Any],
+    *,
+    document: dict[str, Any],
+    revise: bool,
+) -> None:
     review_dir = _review_dir(app, issue, identity, sha)
-    document = read_json(review_dir / "findings.json")
-    if not document:
-        raise WorkflowError("No automated findings are stored. Run run-review or import-review first.")
     existing = read_json(review_dir / "human-review.json")
     if existing and not revise:
         raise WorkflowError("A human review is already recorded. Pass --revise to replace it.")
@@ -433,6 +448,7 @@ def apply_review(app: App, issue: str, human: dict[str, Any], *, revise: bool) -
     else:
         apply_human_decisions(document.get("findings") or [], human)
     write_json(review_dir / "human-review.json", human)
+    diff_index = _diff_index(app, issue, identity, sha)
     if not human.get("rejected_review"):
         merged = apply_human_decisions(document.get("findings") or [], human)
         event = human.get("event") or policy_suggest_event(merged)
@@ -442,14 +458,14 @@ def apply_review(app: App, issue: str, human: dict[str, Any], *, revise: bool) -
             event=event,
             summary=summary,
             findings=merged,
-            diff_index=_diff_index(app, issue, identity, sha),
+            diff_index=diff_index,
         )
         write_json(review_dir / "proposed-review.json", payload)
         _write_review_preview_markdown(
             review_dir,
             sha=sha,
             document=document,
-            diff_index=_diff_index(app, issue, identity, sha),
+            diff_index=diff_index,
             human=human,
             payload=payload,
         )
@@ -458,9 +474,59 @@ def apply_review(app: App, issue: str, human: dict[str, Any], *, revise: bool) -
             review_dir,
             sha=sha,
             document=document,
-            diff_index=_diff_index(app, issue, identity, sha),
+            diff_index=diff_index,
             human=human,
         )
+
+
+def save_snapshot_review(
+    app: App,
+    issue: str,
+    human: dict[str, Any],
+    *,
+    sha: str,
+    identity: tuple[str, str, int] | None = None,
+    revise: bool = False,
+) -> None:
+    """Persist human review for a commit snapshot without advancing the workflow."""
+    issue = require_issue_key(issue)
+    session = _require_review_session(app, issue)
+    resolved_identity = identity or _require_identity(session)
+    review_dir = _review_dir(app, issue, resolved_identity, sha)
+    document = read_json(review_dir / "findings.json")
+    if not document:
+        raise WorkflowError("No automated findings are stored. Run run-review or import-review first.")
+    _persist_human_review_files(
+        app,
+        issue,
+        resolved_identity,
+        sha,
+        human,
+        document=document,
+        revise=revise,
+    )
+    put_decision(session, "human_review", {"choice": "recorded", "at": iso_now()}, sha=sha, revise=revise)
+    app.store.save_session(session)
+
+
+def apply_review(app: App, issue: str, human: dict[str, Any], *, revise: bool) -> StepResult:
+    issue = require_issue_key(issue)
+    session = _require_review_session(app, issue)
+    identity = _require_identity(session)
+    sha = session["active_sha"]
+    review_dir = _review_dir(app, issue, identity, sha)
+    document = read_json(review_dir / "findings.json")
+    if not document:
+        raise WorkflowError("No automated findings are stored. Run run-review or import-review first.")
+    _persist_human_review_files(
+        app,
+        issue,
+        identity,
+        sha,
+        human,
+        document=document,
+        revise=revise,
+    )
     put_decision(session, "human_review", {"choice": "recorded", "at": iso_now()}, sha=sha, revise=revise)
     app.store.save_session(session)
     return resume(app, issue)
@@ -1659,7 +1725,7 @@ def step_publication(app: App, session: dict[str, Any]) -> StepResult | None:
             step="human-review",
             outcome=Outcome.REVIEW_DECISION,
             summary="Accept, reject, or edit the automated findings before publication.",
-            next_command=f"review-ticket {issue} review interactive",
+            next_command=f"review-ticket {issue} attach",
             report_path=str(review_dir / "reviewer-report.md"),
         )
     if human.get("rejected_review"):
@@ -2131,7 +2197,7 @@ def _execute_reviewer(app: App, session: dict[str, Any], *, revise: bool, import
         step="human-review",
         outcome=Outcome.REVIEW_DECISION,
         summary="Automated review is stored locally. Decide each finding before publication.",
-        next_command=f"review-ticket {issue} review interactive",
+        next_command=f"review-ticket {issue} attach",
         report_path=str(review_dir / "reviewer-report.md"),
         details={"completed_step": "automated-review", "reviewer_route": reviewer_route},
     )
@@ -2762,7 +2828,7 @@ def _shows_review_handoff(result: StepResult) -> bool:
     if result.step != "human-review" or result.outcome != Outcome.REVIEW_DECISION:
         return False
     next_cmd = result.next_command or ""
-    if "review interactive" in next_cmd or "import-review" in next_cmd:
+    if next_cmd.rstrip().endswith(" attach") or "import-review" in next_cmd:
         return True
     return result.details.get("completed_step") == "automated-review"
 
@@ -2777,10 +2843,10 @@ def _review_chain_hint(issue: str, result: StepResult) -> str:
     ):
         return (
             f"chain: {prefix} run-review → {prefix} import-review → "
-            f"{prefix} review interactive → {prefix} publish-review --yes"
+            f"{prefix} attach → {prefix} publish-review --yes"
         )
     return (
-        f"chain: {prefix} run-review → {prefix} review interactive → "
+        f"chain: {prefix} run-review → {prefix} attach → "
         f"{prefix} publish-review --yes"
     )
 

@@ -319,11 +319,12 @@ def test_automated_review_ready_handoff_lists_context_and_chain(tmp_path):
     assert "reviewer_command: configured" in output
     assert "chain:" in output
     assert "run-review" in output
-    assert "review interactive" in output
+    assert f"{ISSUE} attach" in output
+    assert "review attach" not in output
     assert "publish-review" in output
 
 
-def test_run_review_next_command_is_review_interactive(tmp_path):
+def test_run_review_next_command_is_review_attach(tmp_path):
     app, _runner, world = make_app(tmp_path, reviewer_command="reviewer {context} {output}")
     _ready_issue(world)
     world.reviewer_output = {
@@ -335,7 +336,7 @@ def test_run_review_next_command_is_review_interactive(tmp_path):
     code = _run(app, [ISSUE, "run-review"])
     output = app.stdout.getvalue()
     assert code == 0
-    assert f"next: review-ticket {ISSUE} review interactive" in output
+    assert f"next: review-ticket {ISSUE} attach" in output
     assert "reviewer_command: configured" in output
 
 

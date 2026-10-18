@@ -36,11 +36,11 @@ Repeat the block below for **Zuul #156**, then **KT.IoT #144**, then **UI.Admin 
 
 | Step | Command | Success signal |
 | --- | --- | --- |
-| A | `review-ticket DOTNETIOT-2550 run-review` | `reviews/.../review/findings.json`; `next` → `review interactive` (or `import-review` if `reviewer_command` unset) |
-| B | `review-ticket DOTNETIOT-2550 review interactive` | Saves `human-review.json` + `proposed-review.json` (same semantics as `review apply --file`) |
+| A | `review-ticket DOTNETIOT-2550 run-review` | `reviews/.../review/findings.json`; `next` → `attach` (or `import-review` if `reviewer_command` unset) |
+| B | `review-ticket DOTNETIOT-2550 attach` | Saves `human-review.json` + `proposed-review.json` (same semantics as `review apply --file`) |
 | C | `review-ticket DOTNETIOT-2550 publish-review --yes` | GitHub review on **current** `active_pr` @ `active_sha` |
 
-**File-based triage (no TUI):** use `review apply` with flags or `--file` instead of step B; optional `review-preview.md` / `reviewer-report.md` under the commit’s `review/` directory.
+**File-based triage (no TTY):** use `review apply` with flags or `--file` instead of step B; optional `review-preview.md` / `reviewer-report.md` under the commit’s `review/` directory.
 
 **Escape hatch:** with `reviewer_command` unset, step A stops at `import-review`; paste normalized JSON, then continue from step B.
 
@@ -50,7 +50,7 @@ At READY, the CLI should show **context** (`.../review/context/prompt.md`), **re
 
 - [ ] `active_pr` is `kwik-trip-iot/KT.IoT.Zuul#156` (first tracked ref after `pr select-all`)
 - [ ] `review-ticket DOTNETIOT-2550 run-review` completes (checkout via `checkout_command` on Windows if needed)
-- [ ] Triage findings → `review interactive` (or `review apply`)
+- [ ] Triage findings → `attach` (or `review apply`)
 - [ ] `publish-review --yes` posts to **Zuul #156** only
 - [ ] Receipt / GitHub UI shows review on Zuul at the session SHA
 
@@ -58,14 +58,14 @@ At READY, the CLI should show **context** (`.../review/context/prompt.md`), **re
 
 - [ ] `review-ticket DOTNETIOT-2550 pr select kwik-trip-iot/KT.IoT#144`
 - [ ] `review-ticket DOTNETIOT-2550` shows `active_pr` KT.IoT#144 and new `active_sha`
-- [ ] Repeat chain: `run-review` → `review interactive` → `publish-review --yes`
+- [ ] Repeat chain: `run-review` → `attach` → `publish-review --yes`
 - [ ] Publication targets **KT.IoT #144** only (not Zuul or UI.Admin)
 
 ## Checklist — PR 3: UI.Admin #354
 
 - [ ] `review-ticket DOTNETIOT-2550 pr select kwik-trip-iot/KT.IoT.UI.Admin#354`
 - [ ] `run-review` receipt or log shows **ui-admin** agent from `reviewer_by_repository`
-- [ ] Repeat chain: `run-review` → `review interactive` → `publish-review --yes`
+- [ ] Repeat chain: `run-review` → `attach` → `publish-review --yes`
 - [ ] Publication targets **UI.Admin #354** only
 
 ## After all three reviews

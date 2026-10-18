@@ -158,6 +158,7 @@ class World:
         self.alerts_stderr = ""
         self.remote_reviews: list = []
         self.transition_code = 0
+        self.comment_code = 0
         self.digest = "sha256:" + "a" * 64
         self.reviewer_output = {
             "summary": "Quantity is not validated on every path.",
@@ -172,6 +173,8 @@ class World:
         if argv[0] == "acli" and "comment" in argv and "list" in argv:
             return self._ok(argv, self.comments)
         if argv[0] == "acli" and "comment" in argv and "create" in argv:
+            if self.comment_code:
+                return CommandResult(argv, self.comment_code, "", "comment failed")
             return self._ok(argv, {"id": "10001"})
         if argv[0] == "acli" and "transition" in argv:
             if self.transition_code:
