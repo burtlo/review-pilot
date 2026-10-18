@@ -96,7 +96,7 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
         choice = "accept" if args.accept else "reject"
         return decide_notes(app, issue, choice, args.notes or "", revise=args.revise)
     if command == "run-review":
-        return run_review(app, issue, revise=args.revise)
+        return run_review(app, issue, revise=args.revise, pr_ref=args.pr_ref, sha=args.sha)
     if command == "import-review":
         return import_review(app, issue, Path(args.file), revise=args.revise)
     if command == "attach":
@@ -104,7 +104,15 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
     if command == "review":
         return _review(app, issue, args)
     if command == "publish-review":
-        return publish_review(app, issue, yes=args.yes, event=args.event, skip=args.skip)
+        return publish_review(
+            app,
+            issue,
+            yes=args.yes,
+            event=args.event,
+            skip=args.skip,
+            pr_ref=args.pr_ref,
+            sha=args.sha,
+        )
     if command == "analyzers":
         if args.accept_dispositions:
             choice = "accept_dispositions"
@@ -260,15 +268,21 @@ def _jira(app: App, issue: str, args: argparse.Namespace) -> StepResult:
 
 
 def _test(app: App, issue: str, args: argparse.Namespace) -> StepResult:
+    target = {"pr_ref": getattr(args, "pr_ref", None), "sha": getattr(args, "sha", None)}
     if args.test_cmd == "prepare":
-        return prepare_profile(app, issue)
+        return prepare_profile(app, issue, **target)
     if args.test_cmd == "fetch":
-        return fetch_image(app, issue)
+        return fetch_image(app, issue, **target)
     if args.test_cmd == "launch":
-        return launch_environment(app, issue)
+        return launch_environment(app, issue, **target)
     if args.test_cmd == "plan":
         return write_test_plan_command(app, issue)
     if args.test_cmd == "record":
+        disposition = {
+            "approve": "APPROVE",
+            "comment": "COMMENT",
+            "request_changes": "REQUEST_CHANGES",
+        }.get(args.disposition) if args.disposition else None
         return record_tests(
             app,
             issue,
@@ -278,6 +292,12 @@ def _test(app: App, issue: str, args: argparse.Namespace) -> StepResult:
             scenarios=args.scenario or [],
             evidence=args.evidence or [],
             revise=args.revise,
+            steps=args.steps or "",
+            observed=args.observed or "",
+            expected=args.expected or "",
+            plan_reference=args.plan_reference or "",
+            disposition=disposition,
+            **target,
         )
     return post_comment(
         app,
@@ -302,6 +322,16 @@ def _split_flag(value: str, flag: str) -> tuple[str, str]:
     if not finding_id or not rest:
         raise WorkflowError(f"{flag} expects ID=value.")
     return finding_id, rest
+
+
+def _add_pr_sha_target_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--pr",
+        dest="pr_ref",
+        metavar="REF",
+        help="Pull request owner/repo#number (default: active PR).",
+    )
+    parser.add_argument("--sha", help="Commit SHA (default: stored SHA for the PR).")
 
 
 def _add_refresh_flag(parser: argparse.ArgumentParser) -> None:
@@ -344,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run-review", help="Check out the SHA and invoke the configured reviewer")
     run.add_argument("--revise", action="store_true")
+    _add_pr_sha_target_flags(run)
     imported = sub.add_parser("import-review", help="Import reviewer JSON into the current SHA")
     imported.add_argument("--file", required=True)
     imported.add_argument("--revise", action="store_true")
@@ -370,6 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--yes", action="store_true")
     publish.add_argument("--event", choices=["COMMENT", "APPROVE", "REQUEST_CHANGES"])
     publish.add_argument("--skip", action="store_true")
+    _add_pr_sha_target_flags(publish)
 
     analyzers = sub.add_parser("analyzers", help="Decide how to treat Bugbot and CodeQL findings")
     analyzer_group = analyzers.add_mutually_exclusive_group(required=True)
@@ -399,17 +431,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     test = sub.add_parser("test", help="Prepare, fetch, launch, or record virtualization testing")
     test_sub = test.add_subparsers(dest="test_cmd", required=True)
-    test_sub.add_parser("prepare")
-    test_sub.add_parser("fetch")
-    test_sub.add_parser("launch")
-    test_sub.add_parser("plan")
+    for name in ("prepare", "fetch", "launch", "plan"):
+        sub_parser = test_sub.add_parser(name)
+        _add_pr_sha_target_flags(sub_parser)
     recorded = test_sub.add_parser("record")
+    _add_pr_sha_target_flags(recorded)
     recorded.add_argument("--result", required=True, choices=["pass", "fail", "blocked"])
     recorded.add_argument("--kind", choices=["implementation", "environment"])
     recorded.add_argument("--notes", default="")
     recorded.add_argument("--scenario", action="append", default=[])
     recorded.add_argument("--evidence", action="append", default=[])
     recorded.add_argument("--revise", action="store_true")
+    recorded.add_argument("--steps", default="")
+    recorded.add_argument("--observed", default="")
+    recorded.add_argument("--expected", default="")
+    recorded.add_argument("--plan-reference", default="")
+    recorded.add_argument("--disposition", choices=["approve", "comment", "request_changes"])
     test_comment = test_sub.add_parser("comment")
     _add_comment_flags(test_comment)
 

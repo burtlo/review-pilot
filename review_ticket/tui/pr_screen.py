@@ -21,11 +21,12 @@ from review_ticket.interactive_triage import (
     set_event,
     set_finding_explanation,
     set_summary,
+    set_track_disposition,
     toggle_must_fix,
     triage_document_if_ready,
 )
 from review_ticket.config import Config
-from review_ticket.textutil import parse_unified_diff
+from review_ticket.textutil import diff_excerpt, parse_unified_diff
 from review_ticket.models import WorkflowError
 from review_ticket.runner import ScriptedRunner
 from review_ticket.storage import read_json
@@ -41,6 +42,15 @@ class PrReviewScreen(Screen[None]):
     """Triage one snapshot; does not change session active PR or SHA."""
 
     BINDINGS = [("escape", "close_review", "Close")]
+
+    CSS = """
+    PrReviewScreen #review-body.narrow {
+        layout: vertical;
+    }
+    PrReviewScreen #review-body.narrow #finding-list {
+        max-height: 12;
+    }
+    """
 
     def __init__(
         self,
@@ -73,6 +83,7 @@ class PrReviewScreen(Screen[None]):
         self._document: dict[str, Any] | None = None
         self._state: TriageState | None = None
         self._diff_index: set[tuple[str, int, str]] = set()
+        self._diff_text = ""
         self._selected_index = 0
         self._has_findings = False
         self._human_on_disk = False
@@ -92,18 +103,25 @@ class PrReviewScreen(Screen[None]):
                 yield Static("", id="finding-meta")
                 yield Static("Explanation", classes="section-label")
                 yield TextArea("", id="explanation-edit")
+                yield Static("Code context", classes="section-label")
+                yield Static("", id="diff-excerpt")
                 yield Static("Suggested change", classes="section-label")
                 yield Static("", id="suggested-change")
             with Horizontal(id="prompt-row"):
                 yield Input(placeholder="Review summary", id="summary-input")
-                yield Input(placeholder="Event (COMMENT, APPROVE, REQUEST_CHANGES)", id="event-input")
+            yield Static("Local track disposition (saved only; not published)", classes="section-label")
+            with Horizontal(id="disposition-row"):
+                yield Button("Approve", id="btn-disp-approve", variant="success")
+                yield Button("Comment", id="btn-disp-comment")
+                yield Button("Request Changes", id="btn-disp-rc", variant="error")
+                yield Button("Confirm blocker", id="btn-disp-confirm", variant="warning")
+            yield Static("", id="disposition-note")
             yield Static("", id="message")
             with Horizontal(id="action-buttons"):
-                yield Button("accept", id="btn-accept", variant="success")
-                yield Button("reject", id="btn-reject", variant="error")
+                yield Button("Include", id="btn-accept", variant="success")
+                yield Button("Exclude", id="btn-reject", variant="error")
                 yield Button("must-fix", id="btn-must-fix")
                 yield Button("edit summary", id="btn-edit-summary")
-                yield Button("edit event", id="btn-edit-event")
                 yield Button("reject automated", id="btn-reject-automated", variant="warning")
                 yield Button("save", id="btn-save", variant="primary")
                 yield Button("close", id="btn-close")
@@ -111,7 +129,7 @@ class PrReviewScreen(Screen[None]):
 
     def on_mount(self) -> None:
         self._load_snapshot()
-        self._apply_layout_mode()
+        self._refresh_chrome()
         if self._has_findings:
             self._refresh_chrome()
             self._mount_findings()
@@ -136,13 +154,17 @@ class PrReviewScreen(Screen[None]):
 
     def _load_diff_index(self) -> set[tuple[str, int, str]]:
         review_dir = self._review_dir()
-        stored = read_json(review_dir / "diff-lines.json")
-        if isinstance(stored, list):
-            return {(str(item[0]), int(item[1]), str(item[2])) for item in stored}
         commit_dir = self._store.commit_dir(self.issue, self.owner, self.repo, self.number, self.sha)
         diff_path = commit_dir / "diff.patch"
         if diff_path.exists():
-            return parse_unified_diff(diff_path.read_text(encoding="utf-8"))
+            self._diff_text = diff_path.read_text(encoding="utf-8")
+        else:
+            self._diff_text = ""
+        stored = read_json(review_dir / "diff-lines.json")
+        if isinstance(stored, list):
+            return {(str(item[0]), int(item[1]), str(item[2])) for item in stored}
+        if self._diff_text:
+            return parse_unified_diff(self._diff_text)
         return set()
 
     def _load_snapshot(self) -> None:
@@ -170,9 +192,16 @@ class PrReviewScreen(Screen[None]):
         self._save_refused_after_save = bool(existing) and not self._revise
 
     def _apply_layout_mode(self) -> None:
-        empty = self.query_one("#empty-state", Static)
         body = self.query_one("#review-body", Vertical)
+        if self.app.size.width < 90:
+            body.add_class("narrow")
+        else:
+            body.remove_class("narrow")
+
+    def _apply_visibility_mode(self) -> None:
+        empty = self.query_one("#empty-state", Static)
         banner = self.query_one("#stale-banner", Static)
+        body = self.query_one("#review-body", Vertical)
         header = self.query_one("#pr-header", Static)
         reviewed = short_sha(self.sha) if self.sha else "—"
         stored = short_sha(self.stored_sha) if self.stored_sha else "—"
@@ -187,8 +216,8 @@ class PrReviewScreen(Screen[None]):
         )
         if self.stale:
             banner.update(
-                f"Stored SHA: {stored} — this open review is not the stored commit. "
-                f"Publish will refuse until run-review is run for the stored SHA."
+                f"Stored SHA: {stored} — historical snapshot at {reviewed} (read-only). "
+                f"Stored HEAD is {stored}. Publish will refuse until run-review is run for the stored SHA."
             )
             banner.display = True
         else:
@@ -216,9 +245,9 @@ class PrReviewScreen(Screen[None]):
 
     def _finding_label(self, index: int, item: FindingState) -> str:
         if item.decision == "accept":
-            mark = "accept"
+            mark = "include"
         elif item.decision == "reject":
-            mark = "reject"
+            mark = "exclude"
         else:
             mark = "undecided"
         must = "must-fix" if item.effective_must_fix else "suggestion"
@@ -248,9 +277,8 @@ class PrReviewScreen(Screen[None]):
         if not self._state:
             return
         summary_input = self.query_one("#summary-input", Input)
-        event_input = self.query_one("#event-input", Input)
         summary_input.value = self._state.summary or ""
-        event_input.value = self._state.event or ""
+        self._refresh_disposition_note()
         self.query_one("#narrative", Markdown).update(self._narrative or "_(No reviewer narrative on disk.)_")
         prompt_row = self.query_one("#prompt-row", Horizontal)
         prompt_row.display = False
@@ -283,9 +311,42 @@ class PrReviewScreen(Screen[None]):
         explanation.text = item.effective_explanation
         suggested = str(machine.get("suggested_change") or "").strip()
         self.query_one("#suggested-change", Static).update(suggested or "_(none)_")
+        excerpt = ""
+        if item.path and self._diff_text:
+            excerpt = diff_excerpt(self._diff_text, item.path, item.line)
+        self.query_one("#diff-excerpt", Static).update(excerpt or "_(No diff context for this location.)_")
+
+    def _refresh_disposition_note(self) -> None:
+        if not self._state:
+            return
+        note = self.query_one("#disposition-note", Static)
+        disp = self._state.track_disposition or "(none)"
+        if self._state.track_disposition == "REQUEST_CHANGES" and not self._state.track_disposition_confirmed:
+            note.update(f"Disposition: {disp} — confirm the blocker before publication handoff.")
+        else:
+            note.update(f"Disposition: {disp} (local only)")
 
     def _refresh_chrome(self) -> None:
         self._apply_layout_mode()
+        self._apply_visibility_mode()
+        read_only = self.stale
+        if read_only:
+            self.query_one("#finding-list", ListView).display = bool(self._state and self._state.findings)
+            self.query_one("#explanation-edit", TextArea).disabled = True
+            for button_id in (
+                "btn-accept",
+                "btn-reject",
+                "btn-must-fix",
+                "btn-edit-summary",
+                "btn-reject-automated",
+                "btn-save",
+                "btn-disp-approve",
+                "btn-disp-comment",
+                "btn-disp-rc",
+                "btn-disp-confirm",
+            ):
+                self.query_one(f"#{button_id}", Button).disabled = True
+            return
         if self._state and self._state.rejected_review:
             self.query_one("#finding-list", ListView).display = False
             self.query_one("#explanation-edit", TextArea).disabled = True
@@ -343,11 +404,15 @@ class PrReviewScreen(Screen[None]):
             row.display = True
             self.query_one("#summary-input", Input).focus()
             return
-        elif button_id == "btn-edit-event":
-            row = self.query_one("#prompt-row", Horizontal)
-            row.display = True
-            self.query_one("#event-input", Input).focus()
-            return
+        elif button_id == "btn-disp-approve":
+            set_track_disposition(self._state, "APPROVE")
+        elif button_id == "btn-disp-comment":
+            set_track_disposition(self._state, "COMMENT")
+        elif button_id == "btn-disp-rc":
+            set_track_disposition(self._state, "REQUEST_CHANGES", confirmed=False)
+        elif button_id == "btn-disp-confirm":
+            if self._state.track_disposition == "REQUEST_CHANGES":
+                set_track_disposition(self._state, "REQUEST_CHANGES", confirmed=True)
         elif button_id == "btn-reject-automated":
             reject_automated_review(self._state)
         elif button_id == "btn-save":
@@ -357,6 +422,7 @@ class PrReviewScreen(Screen[None]):
             return
         self._mount_findings()
         self._select_index(self._selected_index)
+        self._refresh_disposition_note()
         self._refresh_chrome()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -366,15 +432,15 @@ class PrReviewScreen(Screen[None]):
             if event.input.id == "summary-input":
                 set_summary(self._state, event.value)
                 self.query_one("#summary-input", Input).value = self._state.summary
-            elif event.input.id == "event-input":
-                set_event(self._state, event.value if event.value.strip() else None)
-                self.query_one("#event-input", Input).value = self._state.event or ""
         except WorkflowError as exc:
             self._show_message(str(exc))
             return
         self._show_message("")
 
     def _save_review(self) -> None:
+        if self.stale:
+            self._show_message("Historical snapshots are read-only.")
+            return
         if self._save_refused_after_save:
             self._show_message("A human review is already recorded. Pass --revise to replace it.")
             return

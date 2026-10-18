@@ -68,6 +68,10 @@ def _seed_checks(commit_dir: Path, *, outcome: str = "READY") -> None:
 def _seed_three_pr_session(tmp_path: Path) -> None:
     root = tmp_path / "reviews" / ISSUE
     write_json(
+        root / "issue.json",
+        {"key": ISSUE, "summary": "Reject negative quantities", "url": f"https://example.test/browse/{ISSUE}"},
+    )
+    write_json(
         root / "session.json",
         {
             "issue": ISSUE,
@@ -79,25 +83,37 @@ def _seed_three_pr_session(tmp_path: Path) -> None:
             "last_completed_step": "analyzer-findings",
             "outcome": "REVIEW_DECISION",
             "next_command": f"review-ticket {ISSUE} attach",
+            "last_updated": "2026-10-17T18:30:00Z",
         },
     )
-    for ref, sha, url in (
-        (REF_A, SHA1, "https://github.com/acme/widgets/pull/87"),
-        (REF_B, SHA2, "https://github.com/acme/gadgets/pull/12"),
-        (REF_C, SHA3, "https://github.com/acme/tools/pull/3"),
+    for ref, sha, url, pr_title in (
+        (REF_A, SHA1, "https://github.com/acme/widgets/pull/87", "Reject negative quantities"),
+        (REF_B, SHA2, "https://github.com/acme/gadgets/pull/12", "Gadget wiring"),
+        (REF_C, SHA3, "https://github.com/acme/tools/pull/3", "Tooling fix"),
     ):
         owner, rest = ref.split("/", 1)
         repo, number = rest.split("#", 1)
         write_json(
             root / "prs" / _pr_slug(ref) / "pr.json",
-            {"url": url, "number": int(number)},
+            {"url": url, "number": int(number), "title": pr_title},
         )
         commit = _commit_dir(tmp_path, ref, sha)
         commit.mkdir(parents=True, exist_ok=True)
         _seed_checks(commit)
+        write_json(commit / "snapshot.json", {"sha": sha, "captured_at": "2026-10-17T12:00:00Z"})
         if ref == REF_A:
             _seed_findings(commit)
             write_json(commit / "review" / "human-review.json", {"rejected_review": False, "findings": {}})
+            write_json(
+                commit / "review" / "publication.json",
+                {
+                    "status": "success",
+                    "event": "COMMENT",
+                    "sha": SHA1,
+                    "published_at": "2026-10-17T19:00:00Z",
+                    "recorded_at": "2026-10-17T19:00:01Z",
+                },
+            )
         if ref == REF_B:
             _seed_findings(commit)
 
@@ -117,6 +133,8 @@ def test_three_pr_fixture_projects_rows_checks_and_progress(tmp_path):
     store = _store(tmp_path)
     projection = project_review_status(store, ISSUE)
     assert projection.session_exists is True
+    assert projection.issue_title == "Reject negative quantities"
+    assert projection.session_last_updated == "2026-10-17T18:30:00Z"
     assert projection.current_step == "human-review"
     assert projection.last_completed_step == "analyzer-findings"
     assert projection.outcome == "REVIEW_DECISION"
@@ -127,6 +145,10 @@ def test_three_pr_fixture_projects_rows_checks_and_progress(tmp_path):
     assert by_ref[REF_A].stored_sha == SHA1
     assert by_ref[REF_A].url == "https://github.com/acme/widgets/pull/87"
     assert by_ref[REF_A].progress.kind == "recorded"
+    assert by_ref[REF_A].pr_title == "Reject negative quantities"
+    assert by_ref[REF_A].tracks.current_tracks["automated"] == "complete_locally"
+    assert by_ref[REF_A].publication is not None
+    assert by_ref[REF_A].publication.event == "COMMENT"
     assert SHA1[:12] in by_ref[REF_A].progress.label
     assert len(by_ref[REF_A].checks.rows) == 1
     assert by_ref[REF_A].checks.rows[0].name == "build"

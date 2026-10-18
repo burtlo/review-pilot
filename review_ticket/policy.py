@@ -228,8 +228,8 @@ def disposition_checklist(facts: dict) -> list[dict]:
         ),
         (
             "human",
-            "A human reviewed the automated findings.",
-            bool(facts.get("human_review")),
+            "Manual code review is complete for this SHA.",
+            bool(facts.get("manual_review")),
         ),
         (
             "testing",

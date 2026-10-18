@@ -6,7 +6,9 @@ import asyncio
 import json
 from pathlib import Path
 
+from review_ticket.interactive_triage import proposed_payload_from_human
 from review_ticket.storage import Store, read_json, write_json
+from tests.support import DIFF
 from review_ticket.tui import ReviewTicketApp
 from review_ticket.tui.pr_screen import PrReviewScreen
 from review_ticket.tui.status_screen import StatusScreen
@@ -52,6 +54,7 @@ def _seed_rich_findings(commit_dir: Path) -> None:
         },
     )
     write_json(review / "diff-lines.json", [["src/Example.cs", 142, "RIGHT"]])
+    (commit_dir / "diff.patch").write_text(DIFF, encoding="utf-8")
     (review / "reviewer-report.md").write_text(f"# Report\n\n{NARRATIVE_MARKER}\n", encoding="utf-8")
 
 
@@ -136,7 +139,8 @@ def test_stale_banner_lists_stored_sha_and_publish_refusal(tmp_path):
             await pilot.pause()
             text = str(app.screen.query_one("#stale-banner", Static).render())
             assert SHA2[:12] in text or "Stored SHA" in text
-            assert "not the stored commit" in text
+            assert "historical snapshot" in text
+            assert "read-only" in text
             assert "run-review" in text
 
     asyncio.run(_run())
@@ -224,6 +228,84 @@ def test_second_save_without_revise_is_refused(tmp_path):
             await pilot.pause()
             message = str(screen.query_one("#message", Static).render())
             assert "already recorded" in message
+
+    asyncio.run(_run())
+
+
+def test_exclude_finding_persisted_and_omitted_from_payload(tmp_path):
+    _seed_three_pr_session(tmp_path)
+    write_json(
+        _commit_dir(tmp_path, REF_B, SHA2) / "review" / "findings.json",
+        {
+            "summary": "Two findings",
+            "findings": [
+                {
+                    "id": "F001",
+                    "title": "Keep",
+                    "must_fix": False,
+                    "path": "src/Example.cs",
+                    "line": 142,
+                    "side": "RIGHT",
+                    "explanation": "Keep me",
+                },
+                {
+                    "id": "F002",
+                    "title": "Drop",
+                    "must_fix": False,
+                    "explanation": "Drop me",
+                },
+            ],
+        },
+    )
+    write_json(_commit_dir(tmp_path, REF_B, SHA2) / "review" / "diff-lines.json", [["src/Example.cs", 142, "RIGHT"]])
+    (_commit_dir(tmp_path, REF_B, SHA2) / "diff.patch").write_text(DIFF, encoding="utf-8")
+    app = _make_review_app(tmp_path)
+    workflow_app, _, _ = make_app(tmp_path)
+
+    async def _run() -> None:
+        async with app.run_test(size=PILOT_SIZE) as pilot:
+            await pilot.pause()
+            await _open_pr_row(pilot, 1)
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, PrReviewScreen)
+            from review_ticket.interactive_triage import accept_finding, reject_finding
+
+            accept_finding(screen._state, "F001")
+            reject_finding(screen._state, "F002")
+            screen._save_review()
+            await pilot.pause()
+
+    asyncio.run(_run())
+    review_dir = _commit_dir(tmp_path, REF_B, SHA2) / "review"
+    stored = json.loads((review_dir / "human-review.json").read_text(encoding="utf-8"))
+    assert stored["findings"]["F002"]["decision"] == "reject"
+    document = json.loads((review_dir / "findings.json").read_text(encoding="utf-8"))
+    payload = proposed_payload_from_human(
+        workflow_app,
+        ISSUE,
+        stored,
+        document,
+        SHA2,
+        ("acme", "gadgets", 12),
+    )
+    bodies = [comment["body"] for comment in payload.get("comments", [])]
+    assert all("Drop" not in body for body in bodies)
+    assert not (tmp_path / "reviews" / ISSUE / "actions.jsonl").exists()
+
+
+def test_diff_excerpt_rendered_for_selected_finding(tmp_path):
+    _seed_three_pr_session(tmp_path)
+    _seed_rich_findings(_commit_dir(tmp_path, REF_B, SHA2))
+    app = _make_review_app(tmp_path)
+
+    async def _run() -> None:
+        async with app.run_test(size=PILOT_SIZE) as pilot:
+            await pilot.pause()
+            await _open_pr_row(pilot, 1)
+            await pilot.pause()
+            excerpt = str(app.screen.query_one("#diff-excerpt", Static).render())
+            assert "item.Quantity" in excerpt or "Example.cs" in excerpt
 
     asyncio.run(_run())
 
