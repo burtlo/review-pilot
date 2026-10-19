@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from review_ticket.textutil import format_jira_body_markdown
+
 
 def issue_report(issue: dict[str, Any]) -> str:
     comments = issue.get("comments") or []
@@ -37,6 +39,183 @@ Status: **{issue.get('status') or 'unknown'}**
 """
 
 
+def testing_notes_decision_preview(issue: dict[str, Any], *, report_path: str) -> str:
+    testing = issue.get("testing_notes") or "_No testing notes were found._"
+    acceptance = issue.get("acceptance_criteria") or "_No acceptance criteria section was found._"
+    return f"""# Review testing notes — {issue.get('key')}
+
+{issue.get('summary') or 'Untitled'} ({issue.get('status') or 'unknown'})
+{issue.get('url') or ''}
+
+## Acceptance criteria
+
+{acceptance}
+
+## Testing notes
+
+{testing}
+
+Full issue context: {report_path}
+"""
+
+
+def testing_notes_assessment_markdown(issue: dict[str, Any]) -> str:
+    """Markdown for the TUI testing-notes assessment panel (extracted notes + workflow hint)."""
+
+    testing_raw = (issue.get("testing_notes") or "").strip()
+    acceptance_raw = (issue.get("acceptance_criteria") or "").strip()
+    status = issue.get("status") or "unknown"
+
+    lines = [
+        f"**Issue status:** {status}",
+        "",
+    ]
+    if testing_raw:
+        lines.append("**Detected testing notes** (from Jira fields / description sections):")
+        lines.append("")
+        lines.append(format_jira_body_markdown(testing_raw).strip())
+        lines.append("")
+        lines.append(
+            "**Recommendation:** Notes are present — **Accept** if they are adequate for peer review, "
+            "or **Reject** to return the issue with a comment."
+        )
+    else:
+        lines.append("_No testing notes were detected on this issue._")
+        lines.append("")
+        lines.append(
+            "**Recommendation:** Missing notes — the workflow default is **Reject** and transition back to "
+            "In Progress. Use **Accept** if notes appear in the ticket description but were not detected."
+        )
+    if acceptance_raw:
+        lines.extend(
+            [
+                "",
+                "## Acceptance criteria",
+                "",
+                format_jira_body_markdown(acceptance_raw).strip(),
+            ]
+        )
+    return "\n".join(lines).strip() + "\n"
+
+
+def _check_name_markdown(name: str, link: str | None) -> str:
+    display = name or ""
+    url = (link or "").strip()
+    if url:
+        return f"[{display}]({url})"
+    return display
+
+
+def format_checks_table(checks: list[dict[str, Any]]) -> str:
+    rows = ["| Check | Required | Status | State |", "| --- | --- | --- | --- |"]
+    for check in checks:
+        bucket = check.get("bucket") or ""
+        status = _check_status_label(bucket)
+        rows.append(
+            "| {name} | {required} | {status} | {state} |".format(
+                name=_check_name_markdown(check.get("name") or "", check.get("link")),
+                required="yes" if check.get("required") else "no",
+                status=status,
+                state=check.get("state") or "",
+            )
+        )
+    return "\n".join(rows) if checks else "_No checks were reported._"
+
+
+def _check_status_label(bucket: str) -> str:
+    if bucket == "pass":
+        return "pass"
+    if bucket == "pending":
+        return "pending"
+    if bucket in {"fail", "cancel"}:
+        return "fail"
+    if bucket == "missing":
+        return "missing"
+    return bucket or "unknown"
+
+
+def summarize_checks(checks: list[dict[str, Any]]) -> str:
+    required = [item for item in checks if item.get("required")]
+    if not required:
+        optional = len(checks)
+        return f"no required checks ({optional} other check(s) listed)" if optional else "no checks reported"
+    pending = [item["name"] for item in required if item.get("bucket") == "pending"]
+    failed = [item["name"] for item in required if item.get("bucket") in {"fail", "cancel"}]
+    missing = [item["name"] for item in required if item.get("bucket") == "missing"]
+    if pending:
+        return "required waiting: " + ", ".join(pending)
+    if failed:
+        return "required failed: " + ", ".join(failed)
+    if missing:
+        return "required not reported: " + ", ".join(missing)
+    return f"all {len(required)} required check(s) passed"
+
+
+def summarize_findings(findings: list[dict[str, Any]]) -> str:
+    if not findings:
+        return "no Bugbot or CodeQL threads"
+    counts: dict[str, int] = {}
+    for item in findings:
+        attention = str(item.get("attention") or "unknown")
+        counts[attention] = counts.get(attention, 0) + 1
+    parts = [f"{count} {label}" for label, count in sorted(counts.items())]
+    return ", ".join(parts)
+
+
+def multi_pr_analyzer_report(sections: list[dict[str, Any]]) -> str:
+    lines = ["# Analyzer review", "", "## Overview", ""]
+    lines.append(
+        "| Pull request | Link | CI (required) | Analyzer step | Findings |"
+    )
+    lines.append("| --- | --- | --- | --- | --- |")
+    for section in sections:
+        ref = section["pr_ref"]
+        url = section.get("pr_url") or ""
+        link_cell = f"[{ref}]({url})" if url else ref
+        lines.append(
+            "| {ref} | {link} | {checks} | {outcome} | {findings} |".format(
+                ref=ref,
+                link=link_cell,
+                checks=section.get("checks_summary") or "",
+                outcome=section.get("outcome") or "",
+                findings=section.get("findings_summary") or "",
+            )
+        )
+    lines.append("")
+    for section in sections:
+        ref = section["pr_ref"]
+        url = section.get("pr_url") or ""
+        lines.append(f"## {ref}")
+        lines.append("")
+        if url:
+            lines.append(url)
+            lines.append("")
+        readiness = section.get("readiness_summary") or ""
+        if readiness:
+            lines.append(f"**Readiness:** {readiness}")
+            lines.append("")
+        lines.append("### CI checks")
+        lines.append("")
+        lines.append(section.get("checks_table") or "_No checks were stored._")
+        lines.append("")
+        lines.append("### Analyzer findings")
+        lines.append("")
+        lines.append((section.get("detail_markdown") or "").strip())
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def multi_pr_readiness_report(sections: list[tuple[str, str, str]]) -> str:
+    """sections: (pr_ref, outcome, markdown body without top-level title)."""
+    lines = ["# Pull request readiness", ""]
+    for ref, outcome, body in sections:
+        lines.append(f"## {ref} — {outcome}")
+        lines.append("")
+        lines.append(body.strip())
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def readiness_report(
     *,
     pr: dict[str, Any],
@@ -44,15 +223,14 @@ def readiness_report(
     outcome: str,
     summary: str,
 ) -> str:
-    rows = ["| Check | Required | Bucket | State | Link |", "| --- | --- | --- | --- | --- |"]
+    rows = ["| Check | Required | Bucket | State |", "| --- | --- | --- | --- |"]
     for check in checks:
         rows.append(
-            "| {name} | {required} | {bucket} | {state} | {link} |".format(
-                name=check.get("name") or "",
+            "| {name} | {required} | {bucket} | {state} |".format(
+                name=_check_name_markdown(check.get("name") or "", check.get("link")),
                 required="yes" if check.get("required") else "no",
                 bucket=check.get("bucket") or "",
                 state=check.get("state") or "",
-                link=check.get("link") or "",
             )
         )
     draft = "yes" if pr.get("draft") else "no"
@@ -102,6 +280,138 @@ def analyzer_report(findings: list[dict[str, Any]], *, unavailable: str = "") ->
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _finding_on_diff(finding: dict[str, Any], diff_index: set[tuple[str, int, str]]) -> bool:
+    path = finding.get("path")
+    line = finding.get("line")
+    side = finding.get("side") or "RIGHT"
+    return bool(path) and isinstance(line, int) and (path, line, side) in diff_index
+
+
+def publish_preview_counts_for_findings(
+    findings: list[dict[str, Any]],
+    diff_index: set[tuple[str, int, str]],
+    *,
+    human: dict[str, Any] | None = None,
+) -> tuple[int, int]:
+    """Inline vs summary-only counts for accepted findings (matches build_review_payload)."""
+    if human and human.get("rejected_review"):
+        return 0, 0
+    inline = 0
+    summary_only = 0
+    decisions = (human or {}).get("findings") if human else None
+    for finding in findings:
+        if human:
+            decision = (decisions or {}).get(finding["id"]) or {}
+            if decision.get("decision") == "reject":
+                continue
+            if decision.get("decision") != "accept":
+                continue
+        elif finding.get("decision") == "reject":
+            continue
+        if _finding_on_diff(finding, diff_index):
+            inline += 1
+        else:
+            summary_only += 1
+    return inline, summary_only
+
+
+def review_preview(
+    *,
+    sha: str,
+    document: dict[str, Any],
+    findings: list[dict[str, Any]],
+    diff_index: set[tuple[str, int, str]],
+    human: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> str:
+    lines = [f"# Review preview `{sha}`", ""]
+    summary = (human or {}).get("summary") or document.get("summary") or ""
+    if summary.strip():
+        lines.extend(["## Summary", "", summary.rstrip(), ""])
+    if human and human.get("rejected_review"):
+        lines.extend(
+            [
+                "## Publish preview",
+                "",
+                "The automated review was **rejected**. Nothing will be published.",
+                "",
+            ]
+        )
+    else:
+        inline, summary_only = publish_preview_counts_for_findings(findings, diff_index, human=human)
+        if payload:
+            inline = len(payload.get("comments") or [])
+        event = (payload or {}).get("event") or (human or {}).get("event") or ""
+        lines.extend(["## Publish preview", ""])
+        if event:
+            lines.append(f"GitHub review event: **{event}**")
+            lines.append("")
+        lines.append(f"- **{inline}** inline comment(s) on the diff")
+        lines.append(f"- **{summary_only}** finding(s) in the review summary only")
+        if not human:
+            lines.append("")
+            lines.append(
+                "_Counts assume all findings are accepted until you record a human review "
+                "(`review apply` or `review-ticket <issue> attach`)._"
+            )
+        lines.append("")
+    lines.extend(["## Findings", ""])
+    if not findings:
+        lines.append("_No findings were recorded._")
+    else:
+        decisions = (human or {}).get("findings") if human else None
+        for finding in findings:
+            fid = finding.get("id") or ""
+            title = finding.get("title") or "Untitled"
+            if human and human.get("rejected_review"):
+                triage = "n/a"
+            elif human:
+                entry = (decisions or {}).get(fid) or {}
+                triage = entry.get("decision") or "undecided"
+            else:
+                triage = "pending"
+            must = "must-fix" if finding.get("must_fix") else "suggestion"
+            priority = finding.get("priority") or "medium"
+            where = finding.get("path") or "general"
+            if finding.get("line"):
+                where = f"{where}:{finding['line']}"
+            placement = (
+                "inline on diff"
+                if _finding_on_diff(finding, diff_index)
+                else "summary only (off diff or no line)"
+            )
+            if triage == "reject":
+                placement = "will not publish"
+            lines.append(f"### {fid} {title}")
+            lines.append("")
+            lines.append(f"- Triage: **{triage}** · {must} · {priority}")
+            lines.append(f"- Location: `{where}` · {placement}")
+            explanation = finding.get("explanation") or ""
+            if human and not human.get("rejected_review"):
+                entry = (decisions or {}).get(fid) or {}
+                if entry.get("explanation"):
+                    explanation = str(entry["explanation"])
+            if explanation.strip():
+                lines.append("")
+                lines.append(explanation.rstrip())
+            if finding.get("suggested_change"):
+                lines.extend(["", "Suggested change:", "", "```", str(finding["suggested_change"]).rstrip(), "```"])
+            lines.append("")
+    lines.extend(
+        [
+            "## Triage",
+            "",
+            "Run `review-ticket <issue> attach` when you have a TTY. Otherwise edit decisions in "
+            "`human-review.json` and run `review apply --file human-review.json`, or use "
+            "`review apply` flags. "
+            "`reviewer-report.md` is the automated reviewer narrative; this file focuses on "
+            "publish placement and triage status.",
+            "",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def reviewer_report(document: dict[str, Any], findings: list[dict[str, Any]], reconciliation: list[dict[str, Any]]) -> str:
     lines = ["# Automated review", ""]
     if document.get("summary"):
@@ -137,6 +447,42 @@ def reviewer_report(document: dict[str, Any], findings: list[dict[str, Any]], re
             )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def readiness_return_draft(
+    *,
+    issue: str,
+    in_progress_status: str,
+    blocks: list[dict[str, Any]],
+    notes: str = "",
+) -> str:
+    """Jira return text citing only PRs that still need readiness/analyzer attention."""
+
+    if not blocks:
+        reason = "Readiness or analyzer findings still need attention before peer review can continue."
+    else:
+        sections: list[str] = []
+        for block in blocks:
+            ref = block.get("ref") or "pull request"
+            sha = block.get("sha") or ""
+            pr_url = block.get("url") or ""
+            header = f"{ref}"
+            if sha:
+                header += f" — SHA `{sha[:12]}`"
+            if pr_url:
+                header += f" ({pr_url})"
+            lines = block.get("lines") or []
+            body = "\n".join(lines) if lines else "_See the readiness report for details._"
+            sections.append(f"### {header}\n\n{body}")
+        reason = (
+            f"Requesting that {issue} return to **{in_progress_status}**.\n\n"
+            + "\n\n".join(sections)
+            + "\n\nThe ticket can be reviewed again after the blocking findings are resolved."
+        )
+    links: list[str] = []
+    for block in blocks:
+        links.extend(block.get("links") or [])
+    return return_comment(issue=issue, reason=reason, notes=notes, links=links)
 
 
 def return_comment(*, issue: str, reason: str, notes: str, links: list[str] | None = None) -> str:
@@ -194,12 +540,27 @@ def test_results_markdown(result: dict[str, Any]) -> str:
     evidence_lines = [f"- `{item}`" for item in evidence] or ["- None."]
     scenarios = result.get("scenarios") or []
     scenario_lines = [f"- {item}" for item in scenarios] or ["- None recorded."]
+    disposition = result.get("disposition") or "n/a"
     return f"""# Test results `{result.get('sha')}`
 
 Result: **{result.get('result')}**
 Failure kind: {result.get('failure_kind') or 'n/a'}
+Reviewer disposition: **{disposition}**
 Image: `{result.get('image') or ''}`
 Digest: `{result.get('digest') or ''}`
+Plan reference: {result.get('plan_reference') or 'n/a'}
+
+## Steps
+
+{result.get('steps') or '_No steps recorded._'}
+
+## Observed
+
+{result.get('observed') or '_No observed result._'}
+
+## Expected
+
+{result.get('expected') or '_No expected result._'}
 
 ## Scenarios
 

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Callable, Protocol
+
+_LOG = logging.getLogger("review_ticket.runner")
 
 
 @dataclass
@@ -35,6 +39,11 @@ class SubprocessRunner:
         input: str | None = None,
         env: dict[str, str] | None = None,
     ) -> CommandResult:
+        joined = " ".join(argv)
+        _LOG.debug("running command: %s", joined)
+        if cwd:
+            _LOG.debug("command cwd: %s", cwd)
+        started = time.monotonic()
         completed = subprocess.run(
             argv,
             cwd=cwd,
@@ -46,6 +55,18 @@ class SubprocessRunner:
             capture_output=True,
             check=False,
         )
+        elapsed = time.monotonic() - started
+        _LOG.debug(
+            "command finished (%0.1fs) exit=%s: %s",
+            elapsed,
+            completed.returncode,
+            joined,
+        )
+        if completed.returncode != 0 and (completed.stderr or completed.stdout):
+            _LOG.debug(
+                "command stderr/stdout (truncated): %s",
+                ((completed.stderr or "") + (completed.stdout or ""))[:2000],
+            )
         return CommandResult(
             argv=list(argv),
             returncode=completed.returncode,

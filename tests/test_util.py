@@ -3,8 +3,10 @@ from pathlib import Path
 import pytest
 
 from review_ticket import textutil
-from review_ticket.adapters import github_pr_search_query, search_prs
-from review_ticket.config import config_from_mapping, load_config
+from review_ticket.adapters import github_pr_search_query, jira_browse_url, search_prs
+from review_ticket.config import ReviewerProfile, config_from_mapping, load_config
+from review_ticket.logutil import parse_log_level
+from review_ticket.tls_env import default_zscaler_cert_path, zscaler_tls_env
 from review_ticket.models import ToolError
 from review_ticket.runner import ScriptedRunner
 from review_ticket.util import merge_json_documents, parse_json_documents, parse_json_output
@@ -56,6 +58,64 @@ def test_merge_json_documents_concatenates_lists():
 def test_testing_notes_from_custom_field_adf():
     fields = {"customfield_10045": TESTING_NOTES_FIELD, "description": None}
     assert textutil.testing_notes_from_fields(fields, "") == "Ran review-ticket locally."
+
+
+def test_adf_to_markdown_headings_and_lists():
+    doc = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Acceptance Criteria"}],
+            },
+            {
+                "type": "bulletList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "Ship safely"}],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "See "},
+                    {"type": "text", "text": "docs", "marks": [{"type": "link", "attrs": {"href": "https://example.test"}}]},
+                ],
+            },
+        ],
+    }
+    md = textutil.adf_to_markdown(doc)
+    assert "## Acceptance Criteria" in md
+    assert "- Ship safely" in md
+    assert "[docs](https://example.test)" in md
+
+
+def test_testing_notes_assessment_markdown_empty():
+    from review_ticket.reports import testing_notes_assessment_markdown
+
+    md = testing_notes_assessment_markdown(
+        {"key": "X-1", "status": "Ready", "testing_notes": "", "acceptance_criteria": "Must pass."}
+    )
+    assert "No testing notes were detected" in md
+    assert "**Accept**" in md
+    assert "## Acceptance criteria" in md
+    assert "Must pass." in md
+
+
+def test_format_jira_body_markdown_plain_headings():
+    plain = "Acceptance Criteria\nShip safely\n\nTesting Notes\nRan locally."
+    md = textutil.format_jira_body_markdown(plain)
+    assert "## Acceptance Criteria" in md
+    assert "## Testing Notes" in md
+    assert "Ship safely" in md
 
 
 def test_github_pr_search_query_org_and_user():
@@ -121,6 +181,57 @@ def test_status_config_accepts_review_queue_columns():
     assert single.approved_status == "Done"
 
 
+def test_default_zscaler_cert_path_when_present():
+    path = default_zscaler_cert_path()
+    if path is not None:
+        assert path.name.startswith("zscaler-root")
+        assert path.parent.name == "certs"
+
+
+def test_zscaler_tls_env_from_file(tmp_path, monkeypatch):
+    cert = tmp_path / "zscaler.pem"
+    cert.write_text("-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    monkeypatch.setenv("ZSCALER_CERT_PATH", str(cert))
+    env = zscaler_tls_env()
+    assert env["NODE_EXTRA_CA_CERTS"] == str(cert.resolve())
+    assert env["SSL_CERT_FILE"] == str(cert.resolve())
+
+
+def test_log_level_config_and_env(monkeypatch):
+    config = config_from_mapping({"log_level": "debug"}, cwd=Path("."))
+    assert config.log_level == "debug"
+    monkeypatch.setenv("REVIEW_TICKET_LOG_LEVEL", "error")
+    overridden = config_from_mapping({"log_level": "debug"}, cwd=Path("."))
+    assert overridden.log_level == "error"
+    assert parse_log_level("INFO") == 20
+
+
+def test_reviewer_by_repository_yaml_and_resolve():
+    config = config_from_mapping(
+        {
+            "reviewer_command": "default-reviewer {context} {output}",
+            "reviewer_by_repository": {
+                "kwik-trip-iot/KT.IoT.UI.Admin": {"agent": "ui-admin-reviewer"},
+                "acme/widgets": {"command": "widgets-reviewer {context} {output}"},
+            },
+        },
+        cwd=Path("."),
+    )
+    assert config.reviewer_by_repository["kwik-trip-iot/KT.IoT.UI.Admin"] == ReviewerProfile(
+        agent="ui-admin-reviewer"
+    )
+    cmd, label, profile = config.resolve_reviewer("kwik-trip-iot/KT.IoT.UI.Admin")
+    assert cmd == "default-reviewer {context} {output}"
+    assert label == "agent=ui-admin-reviewer (kwik-trip-iot/KT.IoT.UI.Admin)"
+    assert profile and profile.agent == "ui-admin-reviewer"
+    cmd, label, _ = config.resolve_reviewer("acme/widgets")
+    assert cmd == "widgets-reviewer {context} {output}"
+    assert label == "per-repository command (acme/widgets)"
+    cmd, label, _ = config.resolve_reviewer("acme/other")
+    assert cmd == "default-reviewer {context} {output}"
+    assert label == "default"
+
+
 def test_load_config_from_yaml_with_comments(tmp_path):
     (tmp_path / ".review-ticket.yaml").write_text(
         """
@@ -155,3 +266,31 @@ def test_status_config_legacy_top_level_keys():
     assert legacy.accepts_peer_review_status("Ready for Peer Review")
     assert legacy.in_progress_status == "Dev"
     assert legacy.approved_status == "QA"
+
+
+def test_jira_browse_url_from_api_self_link():
+    url = jira_browse_url(
+        "DOTNETIOT-2550",
+        document={
+            "key": "DOTNETIOT-2550",
+            "self": "https://jira-prod-us-71-2.prod.atl-paas.net/rest/api/3/issue/963386",
+        },
+    )
+    assert url == "https://jira-prod-us-71-2.prod.atl-paas.net/browse/DOTNETIOT-2550"
+
+
+def test_jira_browse_url_prefers_config_site():
+    url = jira_browse_url(
+        "DOTNETIOT-2550",
+        document={
+            "key": "DOTNETIOT-2550",
+            "self": "https://jira-prod-us-71-2.prod.atl-paas.net/rest/api/3/issue/963386",
+        },
+        jira_site="https://kwiktrip.atlassian.net",
+    )
+    assert url == "https://kwiktrip.atlassian.net/browse/DOTNETIOT-2550"
+
+
+def test_jira_browse_url_uses_config_when_no_document():
+    url = jira_browse_url("DOTNETIOT-2550", jira_site="https://kwiktrip.atlassian.net")
+    assert url == "https://kwiktrip.atlassian.net/browse/DOTNETIOT-2550"

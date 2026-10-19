@@ -13,6 +13,14 @@ CONFIG_FILENAMES = (".review-ticket.yaml", ".review-ticket.yml", ".review-ticket
 
 
 @dataclass
+class ReviewerProfile:
+    """Per-repository reviewer overrides (command and/or agent id for the adapter)."""
+
+    command: str | None = None
+    agent: str | None = None
+
+
+@dataclass
 class StatusSettings:
     """Jira workflow columns used by review-ticket."""
 
@@ -48,13 +56,15 @@ class Config:
     required_checks: list[str] = field(default_factory=list)
     analyzer_checks: list[str] = field(default_factory=lambda: ["Bugbot", "CodeQL"])
     require_analyzers: bool = True
+    cache_steps: bool = False
     bugbot_authors: list[str] = field(
-        default_factory=lambda: ["cursor[bot]", "bugbot", "cursor-bugbot[bot]"]
+        default_factory=lambda: ["cursor[bot]", "cursor", "bugbot", "cursor-bugbot[bot]"]
     )
     codeql_authors: list[str] = field(
         default_factory=lambda: ["github-advanced-security[bot]", "github-code-scanning[bot]"]
     )
     reviewer_command: str | None = None
+    reviewer_by_repository: dict[str, ReviewerProfile] = field(default_factory=dict)
     bug_writer_command: str | None = None
     checkout_command: str | None = None
     virt_prepare_command: str | None = None
@@ -66,10 +76,12 @@ class Config:
     github_repo: str | None = None
     github_org: str | None = None
     github_user: str | None = None
+    jira_site: str | None = None
     acli_bin: str = "acli"
     gh_bin: str = "gh"
     docker_bin: str = "docker"
     git_bin: str = "git"
+    log_level: str = "warning"
 
     @property
     def in_progress_status(self) -> str:
@@ -85,8 +97,46 @@ class Config:
     def accepts_peer_review_status(self, actual: str) -> bool:
         return self.status.accepts_review_workflow(actual)
 
+    def is_ready_for_peer_review_status(self, actual: str) -> bool:
+        return any(
+            self.status.status_matches(actual, name) for name in self.status.ready_for_peer_review
+        )
+
     def peer_review_status_label(self) -> str:
         return self.status.review_workflow_label()
+
+    def resolve_reviewer(self, repository: str) -> tuple[str | None, str, ReviewerProfile | None]:
+        """Return effective reviewer command, receipt label, and matching profile if any."""
+        profile = self.reviewer_by_repository.get(repository)
+        command = self.reviewer_command
+        if profile and profile.command:
+            command = profile.command
+        if not command:
+            return None, "unset", profile
+        if profile and profile.agent:
+            return command, f"agent={profile.agent} ({repository})", profile
+        if profile and profile.command:
+            return command, f"per-repository command ({repository})", profile
+        return command, "default", profile
+
+
+def _parse_reviewer_profile(value: object) -> ReviewerProfile | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return ReviewerProfile(command=text) if text else None
+    if not isinstance(value, dict):
+        return None
+    command = value.get("command")
+    agent = value.get("agent")
+    profile = ReviewerProfile(
+        command=str(command).strip() if command not in (None, "") else None,
+        agent=str(agent).strip() if agent not in (None, "") else None,
+    )
+    if not profile.command and not profile.agent:
+        return None
+    return profile
 
 
 def _as_list(value: object) -> list[str]:
@@ -141,6 +191,12 @@ def config_from_mapping(data: dict, *, cwd: Path) -> Config:
         config.analyzer_checks = _as_list(data["analyzer_checks"])
     if "require_analyzers" in data:
         config.require_analyzers = bool(data["require_analyzers"])
+    if "cache_steps" in data:
+        config.cache_steps = bool(data["cache_steps"])
+    if os.environ.get("REVIEW_TICKET_LOG_LEVEL"):
+        config.log_level = str(os.environ["REVIEW_TICKET_LOG_LEVEL"]).strip()
+    elif "log_level" in data and data["log_level"] not in (None, ""):
+        config.log_level = str(data["log_level"]).strip()
     if "bugbot_authors" in data:
         config.bugbot_authors = _as_list(data["bugbot_authors"])
     if "codeql_authors" in data:
@@ -160,6 +216,7 @@ def config_from_mapping(data: dict, *, cwd: Path) -> Config:
         "github_repo",
         "github_org",
         "github_user",
+        "jira_site",
         "acli_bin",
         "gh_bin",
         "docker_bin",
@@ -173,6 +230,12 @@ def config_from_mapping(data: dict, *, cwd: Path) -> Config:
             setattr(config, key, os.environ[env_key])
         elif key in data and data[key] not in (None, ""):
             setattr(config, key, str(data[key]))
+    raw_reviewers = data.get("reviewer_by_repository")
+    if isinstance(raw_reviewers, dict):
+        for repo_key, entry in raw_reviewers.items():
+            profile = _parse_reviewer_profile(entry)
+            if profile is not None:
+                config.reviewer_by_repository[str(repo_key)] = profile
     return config
 
 

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from review_ticket.cli import main
+from review_ticket.workflow import resume
 from review_ticket.models import Outcome
 from review_ticket.storage import read_json, write_json
 from tests.support import (
@@ -9,6 +10,7 @@ from tests.support import (
     SHA2,
     World,
     bugbot_thread,
+    iris_pr19_review_threads,
     check,
     jira_document,
     make_app,
@@ -18,6 +20,55 @@ from tests.support import (
     review_threads,
     transitions,
 )
+
+
+def test_interactive_resume_defers_testing_notes_to_attach(tmp_path):
+    app, _runner, world = make_app(tmp_path)
+    world.issue = jira_document("Ran the cart tests and recorded the result.")
+    app.interactive = True
+    result = resume(app, ISSUE)
+    output = app.stdout.getvalue()
+    assert result.outcome == Outcome.REVIEW_DECISION
+    assert f"next: review-ticket {ISSUE} attach" in output
+    assert "Accept testing notes?" not in output
+
+
+def test_multiple_discovered_prs_are_tracked_automatically(tmp_path):
+    app, _runner, world = make_app(tmp_path)
+    doc = jira_document("Ran the cart tests and recorded the result.")
+    doc["fields"]["description"] += (
+        "\nhttps://github.com/acme/widgets/pull/87\n"
+        "https://github.com/acme/other/pull/88\n"
+    )
+    world.issue = doc
+    world.required_checks = passing_checks()
+    world.all_checks = passing_checks()
+    code = _run(app, [ISSUE, "notes", "--accept"])
+    assert code == 0
+    session = read_json(tmp_path / "reviews" / ISSUE / "session.json")
+    assert sorted(session["active_prs"]) == ["acme/other#88", "acme/widgets#87"]
+    assert session["pr_shas"]["acme/widgets#87"] == SHA1
+    assert session["pr_shas"]["acme/other#88"] == SHA1
+
+
+def test_pr_select_limits_scope_to_one_pr(tmp_path):
+    app, _runner, world = make_app(tmp_path)
+    doc = jira_document("Ran the cart tests and recorded the result.")
+    doc["fields"]["description"] += (
+        "\nhttps://github.com/acme/widgets/pull/87\n"
+        "https://github.com/acme/other/pull/88\n"
+    )
+    world.issue = doc
+    world.required_checks = passing_checks()
+    world.all_checks = passing_checks()
+    assert _run(app, [ISSUE, "notes", "--accept"]) == 0
+    session = read_json(tmp_path / "reviews" / ISSUE / "session.json")
+    assert len(session["active_prs"]) == 2
+
+    assert _run(app, [ISSUE, "pr", "select", "acme/widgets#87"]) == 0
+    session = read_json(tmp_path / "reviews" / ISSUE / "session.json")
+    assert session["pr_scope"] == "single"
+    assert session["active_prs"] == ["acme/widgets#87"]
 
 
 def test_missing_testing_notes_recommend_in_progress_and_stop(tmp_path):
@@ -79,10 +130,116 @@ def test_unaddressed_bugbot_finding_recommends_in_progress(tmp_path):
     assert code == 0
     assert "outcome: ACTION_REQUIRED" in output
     assert "recommendation: In Progress" in output
+    assert "jira transition" in output
+    assert "In Progress" in output.split("next:")[-1]
     assert transitions(runner) == []
     stored = read_json(_commit(tmp_path, SHA1) / "bugbot-findings.json")
     assert stored["findings"][0]["attention"] == "unaddressed"
     assert stored["findings"][0]["url"].startswith("https://github.com/")
+
+
+def test_iris_pr19_unresolved_bugbot_suggests_return_to_in_progress(tmp_path):
+    app, runner, world = make_app(tmp_path)
+    _ready_issue(world)
+    world.threads = iris_pr19_review_threads()
+    world.issue = jira_document(
+        "Ran the cart tests and recorded the result.",
+        status="Ready for Peer Review",
+    )
+    world.issue["fields"]["description"] += (
+        "\nhttps://github.com/kwik-trip-iot/KT.Shared.EmailProcessor.Iris/pull/19\n"
+    )
+    code = _run(app, [ISSUE, "notes", "--accept"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "outcome: ACTION_REQUIRED" in output
+    assert "recommendation: In Progress" in output
+    assert "jira transition" in output
+    stored = read_json(tmp_path / "reviews" / ISSUE / "prs" / "acme-widgets-pr-87" / "commits" / SHA1 / "bugbot-findings.json")
+    assert stored["findings"]
+    assert any(item.get("attention") == "unaddressed" for item in stored["findings"])
+    assert transitions(runner) == []
+
+
+def test_code_scanning_api_404_does_not_block_when_codeql_check_passed(tmp_path):
+    app, runner, world = make_app(tmp_path)
+    _ready_issue(world)
+    world.threads = review_threads()
+    world.alerts_code = 1
+    world.alerts_stderr = "gh: Not Found (HTTP 404)"
+    code = _run(app, [ISSUE, "notes", "--accept"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "outcome: BLOCKED" not in output
+    assert "HTTP 404" not in output.split("outcome:")[0]
+    stored = read_json(_commit(tmp_path, SHA1) / "codeql-findings.json")
+    assert stored.get("unavailable")
+
+
+def test_status_output_includes_jira_and_pr_urls(tmp_path):
+    app, _runner, world = make_app(tmp_path)
+    _ready_issue(world)
+    world.issue = jira_document("Ran the cart tests and recorded the result.")
+    world.issue["fields"]["description"] = (
+        (world.issue["fields"]["description"] or "")
+        + "\nhttps://github.com/acme/widgets/pull/87\n"
+    )
+    _run(app, [ISSUE, "notes", "--accept"])
+    app.stdout.truncate(0)
+    app.stdout.seek(0)
+    code = _run(app, [ISSUE, "status"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "jira:" in output
+    assert "https://github.com/acme/widgets/pull/87" in output
+
+
+def test_status_shows_jira_url_from_cached_raw_when_issue_url_empty(tmp_path):
+    app, _runner, _world = make_app(tmp_path)
+    issue_dir = tmp_path / "reviews" / ISSUE
+    issue_dir.mkdir(parents=True)
+    write_json(issue_dir / "issue.json", {"key": ISSUE, "url": ""})
+    write_json(
+        issue_dir / "issue-raw.json",
+        {
+            "view": {
+                "key": ISSUE,
+                "self": "https://jira.example.test/rest/api/3/issue/963386",
+            }
+        },
+    )
+    session = app.store.ensure_session(ISSUE)
+    session["active_pr"] = "acme/widgets#87"
+    session["active_sha"] = SHA1
+    session["active_prs"] = ["acme/widgets#87"]
+    session["pr_shas"] = {"acme/widgets#87": SHA1}
+    app.store.save_session(session)
+    pr_dir = issue_dir / "prs" / "acme-widgets-pr-87"
+    write_json(pr_dir / "pr.json", pr_document(SHA1))
+    app.stdout.truncate(0)
+    app.stdout.seek(0)
+    code = _run(app, [ISSUE, "status"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "jira: https://jira.example.test/browse/DOTNETIOT-1234" in output
+
+
+def test_analyzer_accept_dispositions_records_every_tracked_sha(tmp_path):
+    app, _runner, _world = make_app(tmp_path)
+    session = app.store.ensure_session(ISSUE)
+    session["active_prs"] = ["acme/widgets#87", "acme/other#88"]
+    session["active_pr"] = "acme/widgets#87"
+    session["active_sha"] = SHA1
+    session["pr_shas"] = {"acme/widgets#87": SHA1, "acme/other#88": SHA2}
+    session["pr_scope"] = "all"
+    app.store.save_session(session)
+    from review_ticket.workflow import decide_analyzers
+
+    decide_analyzers(app, ISSUE, "accept_dispositions", "", revise=False)
+    stored = read_json(tmp_path / "reviews" / ISSUE / "session.json")
+    bucket = stored["decisions"]["analyzers"]
+    assert bucket[SHA1]["choice"] == "accept_dispositions"
+    assert bucket[SHA2]["choice"] == "accept_dispositions"
 
 
 def test_dispositioned_bugbot_finding_can_proceed_after_review(tmp_path):
@@ -100,8 +257,103 @@ def test_dispositioned_bugbot_finding_can_proceed_after_review(tmp_path):
     assert "run-review" in output
 
 
+def test_run_review_uses_ui_admin_reviewer_for_mapped_repository(tmp_path):
+    from review_ticket.config import ReviewerProfile
+
+    app, runner, world = make_app(
+        tmp_path,
+        reviewer_command="reviewer {context} {output} {agent}",
+        reviewer_by_repository={
+            "acme/widgets": ReviewerProfile(agent="ui-admin-reviewer"),
+        },
+    )
+    _ready_issue(world)
+    world.reviewer_output = {
+        "summary": "UI admin review.",
+        "approval_recommendation": "approve",
+        "findings": [],
+    }
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "run-review"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "reviewer: agent=ui-admin-reviewer (acme/widgets)" in output
+    reviewer_calls = [call for call in runner.calls if call and call[0] == "reviewer"]
+    assert len(reviewer_calls) == 1
+    assert "ui-admin-reviewer" in " ".join(reviewer_calls[0])
+
+
+def test_run_review_handoff_when_reviewer_command_unset(tmp_path):
+    app, runner, world = make_app(tmp_path, reviewer_command=None)
+    _ready_issue(world)
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "run-review"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "outcome: REVIEW_DECISION" in output
+    assert "import-review" in output
+    assert "context:" in output
+    assert "prompt.md" in output
+    assert "reviewer_command: unset" in output
+    assert not any(call and call[0] == "reviewer" for call in runner.calls)
+
+
+def test_automated_review_ready_handoff_lists_context_and_chain(tmp_path):
+    app, _runner, world = make_app(tmp_path, reviewer_command="reviewer {context} {output}")
+    _ready_issue(world)
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "analyzers", "--accept-dispositions"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "step: automated-review" in output
+    assert "outcome: READY" in output
+    assert "context:" in output and "prompt.md" in output
+    assert "reviewer_command: configured" in output
+    assert "chain:" in output
+    assert "run-review" in output
+    assert f"{ISSUE} attach" in output
+    assert "review attach" not in output
+    assert "test prepare" in output
+
+
+def test_run_review_next_command_is_review_attach(tmp_path):
+    app, _runner, world = make_app(tmp_path, reviewer_command="reviewer {context} {output}")
+    _ready_issue(world)
+    world.reviewer_output = {
+        "summary": "Looks good.",
+        "approval_recommendation": "approve",
+        "findings": [],
+    }
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "run-review"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert f"next: review-ticket {ISSUE} attach" in output
+    assert "reviewer_command: configured" in output
+
+
+def test_review_handoff_multi_pr_hint(tmp_path):
+    app, _runner, world = make_app(tmp_path, reviewer_command="reviewer {context} {output}")
+    doc = jira_document("Ran the cart tests and recorded the result.")
+    doc["fields"]["description"] += (
+        "\nhttps://github.com/acme/widgets/pull/87\n"
+        "https://github.com/acme/other/pull/88\n"
+    )
+    world.issue = doc
+    world.required_checks = passing_checks()
+    world.all_checks = passing_checks()
+    world.threads = review_threads()
+    world.head_sha = SHA1
+    _run(app, [ISSUE, "notes", "--accept"])
+    code = _run(app, [ISSUE, "analyzers", "--accept-dispositions"])
+    output = app.stdout.getvalue()
+    assert code == 0
+    assert "hint:" in output
+    assert "pr select" in output
+
+
 def test_reviewer_places_must_fix_inline_and_keeps_general_findings(tmp_path):
-    app, runner, world = make_app(tmp_path)
+    app, runner, world = make_app(tmp_path, reviewer_command="reviewer {context} {output}")
     _ready_issue(world)
     world.reviewer_output = {
         "summary": "Quantity is not validated on every path.",
@@ -164,13 +416,18 @@ def test_publish_rejects_stale_sha_and_does_not_post(tmp_path):
 
 
 def test_repeat_publication_does_not_create_a_second_review(tmp_path):
+    from review_ticket.util import fingerprint
+
     app, runner, world = make_app(tmp_path)
     _seed_publishable(tmp_path, sha=SHA1)
     world.head_sha = SHA1
     assert _run(app, [ISSUE, "publish-review", "--yes"]) == 0
     assert len(posts(runner)) == 1
-    receipt = read_json(_commit(tmp_path, SHA1) / "review" / "publication.json")
+    review_dir = _commit(tmp_path, SHA1) / "review"
+    receipt = read_json(review_dir / "publication.json")
+    payload = read_json(review_dir / "publish-payload.json")
     assert receipt["github_review_id"] == 4242
+    assert receipt["fingerprint"] == fingerprint(payload)
     assert _run(app, [ISSUE, "publish-review", "--yes"]) == 0
     assert len(posts(runner)) == 1
     assert "already published" in app.stdout.getvalue()
@@ -400,6 +657,8 @@ def _seed_publishable(tmp_path: Path, sha: str) -> None:
             "findings": {"F001": {"decision": "accept", "must_fix": True}},
             "added": [],
             "event": "REQUEST_CHANGES",
+            "track_disposition": "REQUEST_CHANGES",
+            "track_disposition_confirmed": True,
             "summary": "Please validate quantity.",
         },
     )

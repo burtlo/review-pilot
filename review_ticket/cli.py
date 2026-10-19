@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from review_ticket.config import Config, load_config
+from review_ticket.logutil import configure_logging
 from review_ticket.models import AuthorizationDenied, Outcome, StepResult, WorkflowError
 from review_ticket.runner import Runner, SubprocessRunner
 from review_ticket.storage import read_json
@@ -31,6 +32,7 @@ from review_ticket.workflow import (
     record_tests,
     resume,
     run_review,
+    select_all_prs,
     select_pr,
     show_status,
     write_test_plan_command,
@@ -53,10 +55,13 @@ def main(
     except ValueError as exc:
         print(str(exc), file=stderr or sys.stderr)
         return 2
+    resolved_config = config or load_config()
+    configure_logging(resolved_config.log_level, stream=stderr or sys.stderr)
     app = App(
-        config=config or load_config(),
+        config=resolved_config,
         runner=runner or SubprocessRunner(),
         interactive=sys.stdin.isatty() if interactive is None else interactive,
+        refresh=bool(getattr(args, "refresh", False)),
         stdout=stdout,
         stderr=stderr,
     )
@@ -91,13 +96,23 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
         choice = "accept" if args.accept else "reject"
         return decide_notes(app, issue, choice, args.notes or "", revise=args.revise)
     if command == "run-review":
-        return run_review(app, issue, revise=args.revise)
+        return run_review(app, issue, revise=args.revise, pr_ref=args.pr_ref, sha=args.sha)
     if command == "import-review":
         return import_review(app, issue, Path(args.file), revise=args.revise)
+    if command == "attach":
+        return run_review_attach(app, issue, revise=args.revise)
     if command == "review":
         return _review(app, issue, args)
     if command == "publish-review":
-        return publish_review(app, issue, yes=args.yes, event=args.event, skip=args.skip)
+        return publish_review(
+            app,
+            issue,
+            yes=args.yes,
+            event=args.event,
+            skip=args.skip,
+            pr_ref=args.pr_ref,
+            sha=args.sha,
+        )
     if command == "analyzers":
         if args.accept_dispositions:
             choice = "accept_dispositions"
@@ -125,6 +140,32 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
             revise=args.revise,
         )
     raise WorkflowError(f"Unknown command {command}.")
+
+
+def run_review_attach(app: App, issue: str, *, revise: bool) -> StepResult:
+    if not app.interactive:
+        raise WorkflowError(
+            "attach requires an interactive terminal (TTY). "
+            "Use `notes`, `jira comment`, `jira transition`, or `review apply --file` instead."
+        )
+    issue = require_issue_key(issue)
+    session_path = app.store.issue_dir(issue) / "session.json"
+    if not read_json(session_path):
+        app.store.ensure_session(issue)
+
+    from review_ticket.tui import ReviewTicketApp
+
+    ReviewTicketApp(
+        store=app.store,
+        issue=issue,
+        workflow_app=app,
+        revise=revise,
+    ).run()
+    return StepResult(
+        step="human-review",
+        outcome=Outcome.COMPLETE,
+        summary="Review attach session closed.",
+    )
 
 
 def _review(app: App, issue: str, args: argparse.Namespace) -> StepResult:
@@ -200,6 +241,8 @@ def _findings_document(app: App, issue: str) -> dict:
 
 
 def _pr(app: App, issue: str, args: argparse.Namespace) -> StepResult:
+    if args.pr_cmd == "select-all":
+        return select_all_prs(app, issue)
     if args.pr_cmd == "select":
         return select_pr(app, issue, args.pr_ref)
     return post_comment(
@@ -225,15 +268,21 @@ def _jira(app: App, issue: str, args: argparse.Namespace) -> StepResult:
 
 
 def _test(app: App, issue: str, args: argparse.Namespace) -> StepResult:
+    target = {"pr_ref": getattr(args, "pr_ref", None), "sha": getattr(args, "sha", None)}
     if args.test_cmd == "prepare":
-        return prepare_profile(app, issue)
+        return prepare_profile(app, issue, **target)
     if args.test_cmd == "fetch":
-        return fetch_image(app, issue)
+        return fetch_image(app, issue, **target)
     if args.test_cmd == "launch":
-        return launch_environment(app, issue)
+        return launch_environment(app, issue, **target)
     if args.test_cmd == "plan":
         return write_test_plan_command(app, issue)
     if args.test_cmd == "record":
+        disposition = {
+            "approve": "APPROVE",
+            "comment": "COMMENT",
+            "request_changes": "REQUEST_CHANGES",
+        }.get(args.disposition) if args.disposition else None
         return record_tests(
             app,
             issue,
@@ -243,6 +292,12 @@ def _test(app: App, issue: str, args: argparse.Namespace) -> StepResult:
             scenarios=args.scenario or [],
             evidence=args.evidence or [],
             revise=args.revise,
+            steps=args.steps or "",
+            observed=args.observed or "",
+            expected=args.expected or "",
+            plan_reference=args.plan_reference or "",
+            disposition=disposition,
+            **target,
         )
     return post_comment(
         app,
@@ -269,12 +324,40 @@ def _split_flag(value: str, flag: str) -> tuple[str, str]:
     return finding_id, rest
 
 
+def _add_pr_sha_target_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--pr",
+        dest="pr_ref",
+        metavar="REF",
+        help="Pull request owner/repo#number (default: active PR).",
+    )
+    parser.add_argument("--sha", help="Commit SHA (default: stored SHA for the PR).")
+
+
+def _add_refresh_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Bypass cache_steps and re-fetch Jira/GitHub data for this command.",
+    )
+
+
+def _add_refresh_to_subparsers(parser: argparse.ArgumentParser) -> None:
+    for action in parser._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        for sub_parser in action.choices.values():
+            _add_refresh_flag(sub_parser)
+            _add_refresh_to_subparsers(sub_parser)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="review-ticket",
         description="Manual peer review from a Jira issue through GitHub feedback and local testing.",
     )
     parser.add_argument("issue", help="Jira issue id, for example DOTNETIOT-1234")
+    _add_refresh_flag(parser)
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("status", help="Show the stored session without contacting Jira or GitHub")
@@ -291,9 +374,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run-review", help="Check out the SHA and invoke the configured reviewer")
     run.add_argument("--revise", action="store_true")
+    _add_pr_sha_target_flags(run)
     imported = sub.add_parser("import-review", help="Import reviewer JSON into the current SHA")
     imported.add_argument("--file", required=True)
     imported.add_argument("--revise", action="store_true")
+
+    attach = sub.add_parser("attach", help="Open the Textual review UI")
+    attach.add_argument("--revise", action="store_true")
 
     review = sub.add_parser("review", help="Inspect or record the human review")
     review_sub = review.add_subparsers(dest="review_cmd", required=True)
@@ -314,6 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--yes", action="store_true")
     publish.add_argument("--event", choices=["COMMENT", "APPROVE", "REQUEST_CHANGES"])
     publish.add_argument("--skip", action="store_true")
+    _add_pr_sha_target_flags(publish)
 
     analyzers = sub.add_parser("analyzers", help="Decide how to treat Bugbot and CodeQL findings")
     analyzer_group = analyzers.add_mutually_exclusive_group(required=True)
@@ -325,7 +413,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     pr = sub.add_parser("pr", help="Select a pull request or post a general comment")
     pr_sub = pr.add_subparsers(dest="pr_cmd", required=True)
-    select = pr_sub.add_parser("select")
+    pr_sub.add_parser("select-all", help="Track every open pull request discovered for this issue")
+    select = pr_sub.add_parser("select", help="Track a single pull request")
     select.add_argument("pr_ref")
     comment = pr_sub.add_parser("comment")
     _add_comment_flags(comment)
@@ -342,17 +431,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     test = sub.add_parser("test", help="Prepare, fetch, launch, or record virtualization testing")
     test_sub = test.add_subparsers(dest="test_cmd", required=True)
-    test_sub.add_parser("prepare")
-    test_sub.add_parser("fetch")
-    test_sub.add_parser("launch")
-    test_sub.add_parser("plan")
+    for name in ("prepare", "fetch", "launch", "plan"):
+        sub_parser = test_sub.add_parser(name)
+        _add_pr_sha_target_flags(sub_parser)
     recorded = test_sub.add_parser("record")
+    _add_pr_sha_target_flags(recorded)
     recorded.add_argument("--result", required=True, choices=["pass", "fail", "blocked"])
     recorded.add_argument("--kind", choices=["implementation", "environment"])
     recorded.add_argument("--notes", default="")
     recorded.add_argument("--scenario", action="append", default=[])
     recorded.add_argument("--evidence", action="append", default=[])
     recorded.add_argument("--revise", action="store_true")
+    recorded.add_argument("--steps", default="")
+    recorded.add_argument("--observed", default="")
+    recorded.add_argument("--expected", default="")
+    recorded.add_argument("--plan-reference", default="")
+    recorded.add_argument("--disposition", choices=["approve", "comment", "request_changes"])
     test_comment = test_sub.add_parser("comment")
     _add_comment_flags(test_comment)
 
@@ -370,6 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
     disposition.add_argument("--notes", default="")
     disposition.add_argument("--override", action="store_true")
     disposition.add_argument("--revise", action="store_true")
+    _add_refresh_to_subparsers(parser)
     return parser
 
 

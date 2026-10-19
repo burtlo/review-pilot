@@ -56,6 +56,7 @@ def jira_document(notes: str | None, status: str = "Ready for Peer Review") -> d
         description += f"\n## Testing Notes\n\n{notes}\n"
     return {
         "key": ISSUE,
+        "url": f"https://example.test/browse/{ISSUE}",
         "fields": {
             "summary": "Reject negative quantities",
             "status": {"name": status},
@@ -106,6 +107,12 @@ def review_threads(nodes: list[dict] | None = None) -> dict:
     }
 
 
+def iris_pr19_review_threads() -> dict:
+    path = Path(__file__).resolve().parent / "fixtures" / "iris-pr-19-review-thread-nodes.json"
+    nodes = json.loads(path.read_text(encoding="utf-8"))
+    return review_threads(nodes)
+
+
 def bugbot_thread(*, reply: str | None = None, resolved: bool = False) -> dict:
     comments = [
         {
@@ -151,6 +158,9 @@ class World:
         self.alerts_stderr = ""
         self.remote_reviews: list = []
         self.transition_code = 0
+        self.comment_code = 0
+        self.review_code = 0
+        self.compose_up_code = 0
         self.digest = "sha256:" + "a" * 64
         self.reviewer_output = {
             "summary": "Quantity is not validated on every path.",
@@ -165,6 +175,8 @@ class World:
         if argv[0] == "acli" and "comment" in argv and "list" in argv:
             return self._ok(argv, self.comments)
         if argv[0] == "acli" and "comment" in argv and "create" in argv:
+            if self.comment_code:
+                return CommandResult(argv, self.comment_code, "", "comment failed")
             return self._ok(argv, {"id": "10001"})
         if argv[0] == "acli" and "transition" in argv:
             if self.transition_code:
@@ -188,6 +200,8 @@ class World:
                 return CommandResult(argv, self.alerts_code, "", self.alerts_stderr or "HTTP 403")
             return self._ok(argv, self.alerts)
         if "--method" in argv and "POST" in argv and "/reviews" in joined:
+            if self.review_code:
+                return CommandResult(argv, self.review_code, "", "review failed")
             return self._ok(
                 argv,
                 {
@@ -214,10 +228,26 @@ class World:
         if argv[0] == "docker" and "compose" in argv:
             if "down" in argv:
                 raise AssertionError("virtualization must not destroy environments with compose down")
+            if "up" in argv and self.compose_up_code:
+                return CommandResult(argv, self.compose_up_code, "", "compose failed")
             return self._ok(argv, "")
         if argv[0] == "reviewer":
-            Path(argv[-1]).write_text(json.dumps(self.reviewer_output), encoding="utf-8")
+            output_path = next(
+                (part for part in argv if part.endswith("reviewer-output.json")),
+                argv[-1],
+            )
+            Path(output_path).write_text(json.dumps(self.reviewer_output), encoding="utf-8")
             return self._ok(argv, "")
+        if "review-ticket-reviewer-stub.py" in joined:
+            import subprocess
+
+            completed = subprocess.run(argv, capture_output=True, text=True, check=False)
+            return CommandResult(
+                list(argv),
+                completed.returncode,
+                completed.stdout or "",
+                completed.stderr or "",
+            )
         raise AssertionError(f"unexpected command: {joined}")
 
     def _check_code(self, checks: list[dict]) -> int:
@@ -240,10 +270,12 @@ def make_app(tmp_path: Path, world: World | None = None, **config_kwargs) -> tup
     world = world or World()
     runner = ScriptedRunner()
     runner.when(lambda argv: True, world.handle)
+    reviewer_by_repository = config_kwargs.pop("reviewer_by_repository", None)
     config = Config(
         reviews_dir=tmp_path / "reviews",
         cache_dir=tmp_path / "cache",
-        reviewer_command=config_kwargs.pop("reviewer_command", "reviewer {context} {output}"),
+        reviewer_command=config_kwargs.pop("reviewer_command", None),
+        reviewer_by_repository=reviewer_by_repository or {},
         **config_kwargs,
     )
     stdout = io.StringIO()

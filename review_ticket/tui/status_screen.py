@@ -1,0 +1,159 @@
+"""Textual status screen bound to the P4 projection."""
+
+from __future__ import annotations
+
+from textual.app import ComposeResult
+from textual.containers import Vertical, VerticalScroll
+from textual.screen import Screen
+from textual.widgets import Footer, Header, ListItem, ListView, Markdown
+
+from review_ticket.storage import Store, read_json
+from review_ticket.status_projection import PrStatusRow, StatusProjection, project_review_status
+from review_ticket.tui.hub_screen import ReviewHubScreen, should_auto_present_hub
+from review_ticket.tui.pr_screen import PrReviewScreen
+from review_ticket.tui.status_format import format_pr_list_label, format_status_document
+
+
+class StatusScreen(Screen[None]):
+    """Read-only session status; PR rows open the review screen without writing session."""
+
+    BINDINGS = [
+        ("q", "quit_status", "Quit"),
+        ("h", "open_hub", "Hub"),
+    ]
+
+    CSS = """
+    StatusScreen {
+        layout: vertical;
+        overflow: hidden;
+    }
+    StatusScreen Header {
+        dock: top;
+        height: auto;
+    }
+    StatusScreen Footer {
+        dock: bottom;
+        height: auto;
+    }
+    StatusScreen #screen-fill {
+        width: 1fr;
+        height: 1fr;
+        layout: vertical;
+        overflow: hidden;
+    }
+    StatusScreen #status-scroll {
+        height: 1fr;
+        min-height: 0;
+    }
+    StatusScreen #pr-panel {
+        height: auto;
+        max-height: 30%;
+        margin: 0 1 0 1;
+        border: tall $panel;
+        background: $surface;
+        overflow: hidden;
+    }
+    /* ListView defaults to height: 1fr and would leave an empty band under the rows. */
+    StatusScreen #pr-list {
+        height: auto;
+        max-height: 8;
+        background: $surface;
+    }
+    StatusScreen #pr-list Markdown {
+        height: auto;
+        margin: 0;
+        padding: 0 1;
+    }
+    StatusScreen #pr-list Markdown > MarkdownParagraph {
+        margin: 0;
+    }
+    """
+
+    def __init__(self, store: Store, issue: str) -> None:
+        super().__init__()
+        self._store = store
+        self._issue = issue
+        self._projection: StatusProjection | None = None
+        self._pr_rows: tuple[PrStatusRow, ...] = ()
+        self._skip_resume_reload = True
+
+    def on_mount(self) -> None:
+        self._reload()
+        if self._pr_rows:
+            self.query_one("#pr-list", ListView).focus()
+
+    def on_screen_resume(self) -> None:
+        if self._skip_resume_reload:
+            self._skip_resume_reload = False
+            return
+        self._reload()
+
+    def _reload(self) -> None:
+        self._projection = project_review_status(self._store, self._issue)
+        self._pr_rows = self._projection.pr_rows
+        if self._projection.issue_title:
+            self.sub_title = f"{self._issue} — {self._projection.issue_title}"
+        else:
+            self.sub_title = self._issue
+        self.query_one("#status-doc", Markdown).update(format_status_document(self._projection))
+        list_view = self.query_one("#pr-list", ListView)
+        labels = [format_pr_list_label(row) for row in self._pr_rows]
+        self.query_one("#pr-panel", Vertical).display = bool(labels)
+        children = list(list_view.children)
+        if len(children) != len(labels):
+            list_view.clear()
+            if labels:
+                list_view.mount(*[ListItem(Markdown(text)) for text in labels])
+                list_view.index = 0
+        else:
+            for child, text in zip(children, labels, strict=True):
+                child.query_one(Markdown).update(text)
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+        with Vertical(id="screen-fill"):
+            with VerticalScroll(id="status-scroll"):
+                yield Markdown("", id="status-doc")
+            with Vertical(id="pr-panel"):
+                yield ListView(id="pr-list")
+
+    def action_quit_status(self) -> None:
+        self.app.exit()
+
+    def action_open_hub(self) -> None:
+        session = read_json(self._store.issue_dir(self._issue) / "session.json") or {}
+        if not should_auto_present_hub(session):
+            return
+        workflow_app = getattr(self.app, "workflow_app", None)
+        self.app.push_screen(ReviewHubScreen(self._store, self._issue, workflow_app))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.item is None or event.list_view.id != "pr-list":
+            return
+        children = list(event.list_view.children)
+        try:
+            index = children.index(event.item)
+        except ValueError:
+            return
+        if index < 0 or index >= len(self._pr_rows):
+            return
+        row = self._pr_rows[index]
+        snapshot_sha = row.snapshot.open_sha or row.stored_sha
+        workflow_app = getattr(self.app, "workflow_app", None)
+        revise = bool(getattr(self.app, "revise", False))
+        self.app.push_screen(
+            PrReviewScreen(
+                self._store,
+                workflow_app,
+                issue=self._issue,
+                ref=row.ref,
+                owner=row.owner,
+                repo=row.repo,
+                number=row.number,
+                sha=snapshot_sha,
+                stored_sha=row.stored_sha,
+                stale=row.snapshot.stale,
+                revise=revise,
+            )
+        )

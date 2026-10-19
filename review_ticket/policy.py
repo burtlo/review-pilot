@@ -6,6 +6,19 @@ from dataclasses import dataclass
 
 from review_ticket.models import Outcome
 
+OUTCOME_SEVERITY: dict[Outcome, int] = {
+    Outcome.BLOCKED: 0,
+    Outcome.WAITING: 1,
+    Outcome.ACTION_REQUIRED: 2,
+    Outcome.REVIEW_DECISION: 3,
+    Outcome.READY: 4,
+    Outcome.COMPLETE: 5,
+}
+
+
+def outcome_is_worse(left: Outcome, right: Outcome) -> bool:
+    return OUTCOME_SEVERITY[left] < OUTCOME_SEVERITY[right]
+
 
 @dataclass
 class Check:
@@ -215,8 +228,8 @@ def disposition_checklist(facts: dict) -> list[dict]:
         ),
         (
             "human",
-            "A human reviewed the automated findings.",
-            bool(facts.get("human_review")),
+            "Manual code review is complete for this SHA.",
+            bool(facts.get("manual_review")),
         ),
         (
             "testing",
