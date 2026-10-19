@@ -77,8 +77,12 @@ def test_status_screen_renders_three_pr_fixture(tmp_path):
             pr_list = app.screen.query_one("#pr-list")
             assert len(list(pr_list.children)) == 3
             row = pr_list.children[0].query_one(Markdown).source
-            assert row.startswith("[acme/widgets#87](https://github.com/acme/widgets/pull/87)")
-            assert row.count("https://github.com/acme/widgets/pull/87") == 1
+            files_changed = (
+                "https://github.com/acme/widgets/pull/87/changes"
+                f"?review_pilot_issue={ISSUE}&review_pilot_sha={SHA1}"
+            )
+            assert row.startswith(f"[acme/widgets#87]({files_changed})")
+            assert row.count(files_changed) == 1
             assert "**Link:**" not in text
 
     asyncio.run(_run())

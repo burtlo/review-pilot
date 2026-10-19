@@ -42,6 +42,7 @@ from review_ticket.findings import (
     normalize_findings,
     reconcile,
 )
+from review_ticket.inline_review import files_changed_url, is_full_sha
 from review_ticket.models import Outcome, StepResult, ToolError, WorkflowError
 from review_ticket.policy import (
     Check,
@@ -3432,16 +3433,26 @@ def _multi_pr_review_hint(active_prs: list[str]) -> str | None:
     )
 
 
-def _pr_url_for_ref(app: App, issue: str, ref: str) -> str:
+def _sha_for_pr_link(session: dict[str, Any], ref: str) -> str:
+    pr_shas: dict[str, str] = session.get("pr_shas") or {}
+    sha = pr_shas.get(ref)
+    if not sha and ref == session.get("active_pr"):
+        sha = session.get("active_sha")
+    return str(sha or "")
+
+
+def _pr_url_for_ref(app: App, issue: str, ref: str, sha: str = "") -> str:
     try:
         owner, repo, number = parse_pr_ref(ref)
     except ValueError:
         return ""
+    if is_full_sha(sha):
+        return files_changed_url(owner, repo, number, issue, sha)
     pr = read_json(app.store.pr_dir(issue, owner, repo, number) / "pr.json") or {}
     url = str(pr.get("url") or "").strip()
     if url:
         return url
-    return f"https://github.com/{owner}/{repo}/pull/{number}"
+    return files_changed_url(owner, repo, number, issue, "")
 
 
 def _render(app: App, session: dict[str, Any], result: StepResult) -> None:
@@ -3458,14 +3469,14 @@ def _render(app: App, session: dict[str, Any], result: StepResult) -> None:
     if len(active_prs) > 1:
         for ref in active_prs:
             pr_line = f"pr: {ref} @ {short_sha(pr_shas.get(ref) or '')}"
-            pr_url = _pr_url_for_ref(app, issue_key, ref) if issue_key else ""
+            pr_url = _pr_url_for_ref(app, issue_key, ref, _sha_for_pr_link(session, ref)) if issue_key else ""
             if pr_url:
                 pr_line += f"  {pr_url}"
             lines.append(pr_line)
     elif session.get("active_pr"):
         ref = str(session["active_pr"])
         pr_line = f"pr: {ref} @ {short_sha(session.get('active_sha') or '')}"
-        pr_url = _pr_url_for_ref(app, issue_key, ref) if issue_key else ""
+        pr_url = _pr_url_for_ref(app, issue_key, ref, _sha_for_pr_link(session, ref)) if issue_key else ""
         if pr_url:
             pr_line += f"  {pr_url}"
         lines.append(pr_line)

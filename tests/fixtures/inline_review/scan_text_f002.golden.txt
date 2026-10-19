@@ -1,0 +1,1 @@
+### F002 Unrelated helper (suggestion) This behavior lives outside the diff. Location: `src/Example.cs:10` review-pilot finding F002

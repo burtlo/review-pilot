@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from review_ticket.config import Config, load_config
+from review_ticket.inline_review import DEFAULT_BRIDGE_PORT, serve_inline_review
 from review_ticket.logutil import configure_logging
 from review_ticket.models import AuthorizationDenied, Outcome, StepResult, WorkflowError
 from review_ticket.runner import Runner, SubprocessRunner
@@ -101,6 +102,8 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
         return import_review(app, issue, Path(args.file), revise=args.revise)
     if command == "attach":
         return run_review_attach(app, issue, revise=args.revise)
+    if command == "serve-inline-review":
+        return _serve_inline_review(app, issue, args)
     if command == "review":
         return _review(app, issue, args)
     if command == "publish-review":
@@ -132,6 +135,23 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
             revise=args.revise,
         )
     raise WorkflowError(f"Unknown command {command}.")
+
+
+def _serve_inline_review(app: App, issue: str, args: argparse.Namespace) -> StepResult:
+    server = serve_inline_review(app.store, issue, pr=args.pr, sha=args.sha, port=args.port)
+    host, port = server.server_address[:2]
+    app.write(f"Serving inline review at http://{host}:{port}/snapshot\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return StepResult(
+        step="inline-review",
+        outcome=Outcome.COMPLETE,
+        summary="Inline review bridge stopped.",
+    )
 
 
 def run_review_attach(app: App, issue: str, *, revise: bool) -> StepResult:
@@ -358,6 +378,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     attach = sub.add_parser("attach", help="Open the Textual review UI")
     attach.add_argument("--revise", action="store_true")
+
+    serve = sub.add_parser(
+        "serve-inline-review",
+        help="Serve one reviewed snapshot on 127.0.0.1 for the inline reviewer",
+    )
+    serve.add_argument("--pr", help="owner/repo#number (default: the active pull request)")
+    serve.add_argument("--sha", help="Reviewed commit (default: pr_shas for that pull request)")
+    serve.add_argument("--port", type=int, default=DEFAULT_BRIDGE_PORT)
 
     review = sub.add_parser("review", help="Inspect or record the human review")
     review_sub = review.add_subparsers(dest="review_cmd", required=True)

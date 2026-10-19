@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from review_ticket.inline_review import files_changed_url, is_full_sha
 from review_ticket.policy import classify_track_status
 from review_ticket.storage import Store, read_json
 from review_ticket.util import parse_pr_ref, require_issue_key, short_sha
@@ -233,11 +234,15 @@ def pr_url_for_ref(store: Store, issue: str, ref: str) -> str:
         owner, repo, number = parse_pr_ref(ref)
     except ValueError:
         return ""
+    session = read_json(store.issue_dir(issue) / "session.json") or {}
+    sha = _stored_sha(session, ref)
+    if is_full_sha(sha):
+        return files_changed_url(owner, repo, number, issue, sha)
     pr = read_json(store.pr_dir(issue, owner, repo, number) / "pr.json") or {}
     url = str(pr.get("url") or "").strip()
     if url:
         return url
-    return f"https://github.com/{owner}/{repo}/pull/{number}"
+    return files_changed_url(owner, repo, number, issue, "")
 
 
 def _active_pr_refs(session: dict[str, Any]) -> list[str]:

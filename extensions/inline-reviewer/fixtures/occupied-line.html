@@ -1,0 +1,21 @@
+<!-- Two comments on src/Example.cs:142. The first has no marker for F005.
+     F005 stays inline. This scan does not edit the other comment. -->
+<div
+  class="markdown-body"
+  data-review-pilot-comment="submitted"
+  data-path="src/Example.cs"
+  data-line="142"
+  data-side="RIGHT">
+  <p>Already noted on this line. Missing validation without a marker.</p>
+</div>
+<div
+  class="markdown-body"
+  data-review-pilot-comment="submitted"
+  data-path="src/Example.cs"
+  data-line="142"
+  data-side="RIGHT">
+  <p>Missing validation (Must-fix, high)</p>
+  <p>This path permits an invalid state.</p>
+  <pre>if (item.Quantity &lt; 0) throw new InvalidOperationException();</pre>
+  <p>review-pilot finding F001</p>
+</div>

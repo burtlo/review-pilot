@@ -146,7 +146,10 @@ def test_three_pr_fixture_projects_rows_checks_and_progress(tmp_path):
 
     by_ref = {row.ref: row for row in projection.pr_rows}
     assert by_ref[REF_A].stored_sha == SHA1
-    assert by_ref[REF_A].url == "https://github.com/acme/widgets/pull/87"
+    assert by_ref[REF_A].url == (
+        "https://github.com/acme/widgets/pull/87/changes"
+        f"?review_pilot_issue={ISSUE}&review_pilot_sha={SHA1}"
+    )
     assert by_ref[REF_A].progress.kind == "recorded"
     assert SHA1[:12] in by_ref[REF_A].progress.label
     assert len(by_ref[REF_A].checks.rows) == 1

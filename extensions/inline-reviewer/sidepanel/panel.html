@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Review Pilot</title>
+    <link rel="stylesheet" href="panel.css">
+  </head>
+  <body>
+    <header>
+      <h1>Review Pilot</h1>
+      <span class="header-actions">
+        <button type="button" id="reload">Reload snapshot</button>
+        <button type="button" id="refresh-scan">Refresh scan</button>
+        <button type="button" id="prepare-all">Prepare all</button>
+      </span>
+    </header>
+    <label class="toggle" for="replace-modified-drafts">
+      <input id="replace-modified-drafts" type="checkbox">
+      Replace modified drafts
+    </label>
+    <p class="hint">Off by default. A modified draft then needs Confirm replace on that finding. Refresh scan only reads the page.</p>
+    <p class="hint">Prepare fills one composer and leaves it open. Prepare all stages each on-diff comment, then writes the off-diff summary once. It does not submit.</p>
+    <section id="status" aria-live="polite"></section>
+    <section id="settings">
+      <h2>Settings</h2>
+      <label for="token">Bridge shared secret</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false">
+      <p class="hint">Same value as REVIEW_PILOT_BRIDGE_TOKEN on the review-ticket process. The page on github.com never receives it.</p>
+      <label for="allowlist">Repository allowlist</label>
+      <textarea id="allowlist" spellcheck="false" placeholder="kwik-trip-iot/*&#10;*/*"></textarea>
+      <p class="hint">One owner/repo pattern per line. * matches inside a single segment and does not cross /. An empty list matches nothing.</p>
+      <label for="port">Bridge port</label>
+      <input id="port" type="number" min="1" max="65535" value="8765">
+      <p class="hint">Default 8765. Must match serve-inline-review --port.</p>
+      <button type="button" id="save-settings">Save settings</button>
+      <p id="save-status" class="hint"></p>
+    </section>
+    <section id="debug">
+      <h2>Selector debug</h2>
+      <p class="hint">Probe highlights a row without pasting. Dry-run opens the composer and leaves the textarea empty. Stored overrides replace packaged defaults until cleared.</p>
+      <label for="probe-path">Path</label>
+      <input id="probe-path" type="text" spellcheck="false" autocomplete="off">
+      <label for="probe-line">Line</label>
+      <input id="probe-line" type="number" min="1">
+      <label for="probe-start">Start line</label>
+      <input id="probe-start" type="number" min="1">
+      <div class="debug-actions">
+        <button type="button" id="probe">Probe</button>
+        <button type="button" id="dry-run">Dry-run</button>
+      </div>
+      <label for="selector-entry">Registry entry</label>
+      <select id="selector-entry"></select>
+      <p id="override-count" class="hint"></p>
+      <div class="debug-actions">
+        <button type="button" id="pick-selector">Pick element</button>
+        <button type="button" id="copy-debug">Copy debug bundle</button>
+        <button type="button" id="clear-overrides">Clear selector overrides</button>
+      </div>
+      <p id="debug-status" class="hint"></p>
+    </section>
+    <script src="../lib/debug.js"></script>
+    <script src="../lib/panel-model.js"></script>
+    <script src="panel.js"></script>
+  </body>
+</html>

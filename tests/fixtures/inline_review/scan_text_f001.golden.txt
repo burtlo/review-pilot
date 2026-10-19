@@ -1,0 +1,1 @@
+Missing validation (Must-fix, high) This path permits an invalid state. if (item.Quantity < 0) throw new InvalidOperationException(); review-pilot finding F001
