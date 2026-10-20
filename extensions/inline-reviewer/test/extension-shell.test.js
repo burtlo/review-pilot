@@ -37,7 +37,7 @@ test("manifest is one unpacked MV3 side panel", () => {
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.side_panel.default_path, "sidepanel/panel.html");
   assert.deepEqual(manifest.host_permissions, ["https://github.com/*", "http://127.0.0.1/*"]);
-  assert.deepEqual(manifest.permissions, ["storage", "sidePanel"]);
+  assert.deepEqual(manifest.permissions, ["storage", "sidePanel", "scripting"]);
   assert.equal(manifest.content_scripts.length, 1);
   const script = manifest.content_scripts[0];
   assert.equal(script.run_at, "document_start");
@@ -49,14 +49,10 @@ test("manifest is one unpacked MV3 side panel", () => {
     "lib/sha-gate.js",
     "lib/prepare.js",
     "lib/debug.js",
+    "lib/diff-nav.js",
     "content/content-script.js",
   ]);
-  assert.deepEqual(script.matches, [
-    "https://github.com/*/*/pull/*/changes",
-    "https://github.com/*/*/pull/*/changes/",
-    "https://github.com/*/*/pull/*/files",
-    "https://github.com/*/*/pull/*/files/",
-  ]);
+  assert.deepEqual(script.matches, ["https://github.com/*"]);
   assert.equal(JSON.stringify(manifest).includes("Bearer"), false);
   assert.equal(manifest.background.service_worker, "background/service-worker.js");
   assert.equal(manifest.background.type, undefined);

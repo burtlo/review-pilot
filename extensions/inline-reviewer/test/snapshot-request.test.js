@@ -143,6 +143,7 @@ test("the service worker request uses 127.0.0.1 and a bearer header", async () =
   assert.equal(url.searchParams.get("repo"), "repo");
   assert.equal(url.searchParams.get("number"), "4");
   assert.equal(url.searchParams.get("sha"), "from-link");
+  assert.equal(url.searchParams.get("issue"), "RP-1");
   assert.equal(url.searchParams.get("token"), null);
   assert.equal(seen.calls[0].url.includes(TOKEN), false);
   assert.equal(seen.calls[0].url.includes("github.com"), false);
@@ -258,4 +259,112 @@ test("snapshot markup ignores a token planted on the model", () => {
   );
   assert.equal(escaped.includes("<img"), false);
   assert.match(escaped, /&lt;img/);
+});
+
+test("a files-changed page without review_pilot_sha still calls the bridge", async () => {
+  const seen = countedFetch();
+  const href = "https://github.com/owner/repo/pull/4/changes";
+  const result = await load(href, { allowlist: "owner/*", token: TOKEN, port: 8765 }, seen.fetchImpl);
+  assert.equal(result.ok, true);
+  assert.equal(seen.calls.length, 1);
+  const url = new URL(seen.calls[0].url);
+  assert.equal(url.searchParams.get("owner"), "owner");
+  assert.equal(url.searchParams.get("repo"), "repo");
+  assert.equal(url.searchParams.get("number"), "4");
+  assert.equal(url.searchParams.get("sha"), null);
+  assert.equal(url.searchParams.get("issue"), null);
+  assert.equal(url.searchParams.get("token"), null);
+});
+
+test("issue is sent only when the deep link captured one", () => {
+  const withIssue = planSnapshotRequest({
+    captured: {
+      owner: "owner",
+      repo: "repo",
+      number: 4,
+      view: "changes",
+      issue: "RP-1",
+      sha: "",
+    },
+    settings: { allowlist: "*/*", token: TOKEN, port: 8765 },
+  });
+  assert.equal(withIssue.ok, true);
+  assert.equal(new URL(withIssue.url).searchParams.get("issue"), "RP-1");
+  assert.equal(new URL(withIssue.url).searchParams.get("sha"), null);
+
+  const withoutIssue = planSnapshotRequest({
+    captured: {
+      owner: "owner",
+      repo: "repo",
+      number: 4,
+      view: "changes",
+      issue: "",
+      sha: "abc",
+    },
+    settings: { allowlist: "*/*", token: TOKEN, port: 8765 },
+  });
+  assert.equal(new URL(withoutIssue.url).searchParams.get("issue"), null);
+  assert.equal(new URL(withoutIssue.url).searchParams.get("sha"), "abc");
+});
+
+test("candidate_count above one warns and a single candidate does not", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const multiple = renderPanelHtml(
+    panelFromPlan({
+      plan: { ok: true },
+      snapshot: {
+        issue: "DOTNETIOT-2000",
+        resolved_issue: "DOTNETIOT-2000",
+        pr: "owner/repo#4",
+        sha: sha,
+        resolved_sha: sha,
+        candidate_count: 2,
+        resolution: "newest_mtime",
+        findings: [{ id: "f1", title: "Latch the relay", path: "src/app.py", line: 10, side: "RIGHT", on_diff: true }],
+      },
+    })
+  );
+  assert.match(multiple, /data-ambiguity="multiple"/);
+  assert.match(multiple, /Multiple automated reviews exist for this pull request/);
+  assert.match(multiple, /DOTNETIOT-2000 @ 0123456789ab/);
+  assert.match(multiple, /Open the link from the ticket you are reviewing to pin issue and SHA/);
+  const warningAt = multiple.indexOf("data-ambiguity");
+  const findingsAt = multiple.indexOf("<h2>Findings</h2>");
+  const summaryAt = multiple.indexOf("<dt>Reviewed SHA</dt>");
+  assert.ok(summaryAt < warningAt);
+  assert.ok(warningAt < findingsAt);
+
+  const single = renderPanelHtml(
+    panelFromPlan({
+      plan: { ok: true },
+      snapshot: {
+        issue: "DOTNETIOT-2000",
+        pr: "owner/repo#4",
+        sha: sha,
+        candidate_count: 1,
+        findings: [{ id: "f1", title: "Latch the relay", path: "src/app.py", line: 10, side: "RIGHT", on_diff: true }],
+      },
+    })
+  );
+  assert.equal(single.includes("data-ambiguity"), false);
+  assert.equal(single.includes("Multiple automated reviews"), false);
+});
+
+test("not-found copy depends on whether the request included a sha", () => {
+  const unpinned = renderPanelHtml(
+    panelFromPlan({
+      plan: { ok: false, reason: "not-found", status: 404 },
+      captured: { owner: "owner", repo: "repo", number: 4, sha: "" },
+    })
+  );
+  assert.match(unpinned, /No automated review found for this pull request/);
+  assert.equal(unpinned.includes("reviewed SHA"), false);
+
+  const pinned = renderPanelHtml(
+    panelFromPlan({
+      plan: { ok: false, reason: "not-found", status: 404 },
+      captured: { owner: "owner", repo: "repo", number: 4, sha: "abc" },
+    })
+  );
+  assert.match(pinned, /no snapshot for this pull request and reviewed SHA/);
 });

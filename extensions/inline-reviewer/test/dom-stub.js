@@ -240,10 +240,12 @@ function createPage(options) {
   function ensureFile(filePath) {
     const key = filePath || "src/Example.cs";
     if (filesByPath[key]) return filesByPath[key];
-    const file = makeElement("div", {
-      "data-file-path": key,
-      "data-collapsed": opts.collapsed ? "true" : "false",
-    });
+    const fileAttrs = { "data-collapsed": opts.collapsed ? "true" : "false" };
+    if (!opts.pathOnAria) fileAttrs["data-file-path"] = key;
+    const file = makeElement("div", fileAttrs);
+    const table = opts.pathOnAria
+      ? makeElement("table", { "aria-label": "Diff for: " + key, role: "grid" })
+      : null;
     const expand = button("Toggle diff contents", { "data-expand-file": "" });
     const viewed = button("Viewed");
     expand.onEvent = function (event) {
@@ -254,6 +256,9 @@ function createPage(options) {
     };
     append(file, expand);
     append(file, viewed);
+    if (table) append(file, table);
+    file.lineHost = table || file;
+    file.reviewPath = key;
     append(fileList, file);
     filesByPath[key] = file;
     return file;
@@ -290,7 +295,7 @@ function createPage(options) {
     for (let i = 0; i < lineBag.length; i += 1) {
       const spec = lineBag[i];
       if (spec.mounted) continue;
-      if (onlyFile && spec.path !== onlyFile.getAttribute("data-file-path")) continue;
+      if (onlyFile && spec.path !== (onlyFile.getAttribute("data-file-path") || onlyFile.reviewPath)) continue;
       if (opts.collapsed && filesByPath[spec.path] && filesByPath[spec.path].getAttribute("data-collapsed") === "true") {
         continue;
       }
@@ -318,7 +323,7 @@ function createPage(options) {
       append(codeCell, textNode("return item;"));
       append(row, numberCell);
       append(row, codeCell);
-      append(file, row);
+      append(file.lineHost || file, row);
     }
   }
 
@@ -329,7 +334,7 @@ function createPage(options) {
     hunk.onEvent = function (event) {
       if (event.type !== "click") return;
       lineBag.forEach(function (spec) {
-        if (spec.path === file.getAttribute("data-file-path")) spec.hunkOpen = true;
+        if (spec.path === (file.getAttribute("data-file-path") || file.reviewPath)) spec.hunkOpen = true;
       });
       mountLines(file);
     };
@@ -340,7 +345,10 @@ function createPage(options) {
   function showPlus(row) {
     if (row.getAttribute("data-plus") === "true") return;
     row.setAttribute("data-plus", "true");
-    const plus = button("+", { "data-add-comment": "" });
+    const label = opts.commentLabel || "+";
+    const plus = label === "+"
+      ? button("+", { "data-add-comment": "" })
+      : button(label);
     plus.onEvent = function (event) {
       if (event.type !== "click") return;
       openComposer();

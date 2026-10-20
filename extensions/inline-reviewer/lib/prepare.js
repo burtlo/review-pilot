@@ -11,12 +11,12 @@
 
   const HEADER = "## Findings outside the diff";
   const DEFAULTS = {
-    "file-block": "[data-file-path]",
+    "file-block": "[data-file-path], [data-path], table[aria-label^='Diff for: ']",
     "file-filter": "[data-file-filter], [aria-label='File filter']",
     "expand-file": "[data-expand-file], [aria-label='Toggle diff contents']",
     "expand-hunk": "[data-expand-hunk], [aria-label='Expand Down'], [aria-label='Expand Up']",
     "line-number": "[data-diff-side][data-line-number]",
-    "add-comment-button": "[data-add-comment], [aria-label='+']",
+    "add-comment-button": "[data-add-comment], [aria-label='+'], [aria-label='Add comment']",
     "markdown-textarea": "textarea[aria-label='Markdown value'], textarea",
     "stage-review-button": "Start a review",
     "composer-comment": "Comment",
@@ -357,6 +357,8 @@
     while (cur) {
       const path = attr(cur, "data-file-path") || attr(cur, "data-path");
       if (path) return path;
+      const label = attr(cur, "aria-label");
+      if (label.indexOf("Diff for: ") === 0) return label.slice("Diff for: ".length).trim();
       cur = cur.parentNode || cur.parentElement || null;
     }
     return "";
@@ -396,6 +398,12 @@
     const files = queryAll(doc, selectors["file-block"] || DEFAULTS["file-block"]);
     for (let i = 0; i < files.length; i += 1) {
       if (attr(files[i], "data-file-path") === path) return files[i];
+    }
+    for (let i = 0; i < files.length; i += 1) {
+      if (filePathOf(files[i]) === path && attr(files[i], "aria-label").indexOf("Diff for: ") === 0) return files[i];
+    }
+    for (let i = 0; i < files.length; i += 1) {
+      if (attr(files[i], "data-path") === path) return files[i];
     }
     return null;
   }
@@ -654,11 +662,48 @@
       return null;
     }
 
-    function findAddButton() {
-      const found = queryAll(doc, selectors["add-comment-button"]);
+    function rowOf(cell) {
+      return ancestor(cell, function (node) {
+        return String(node && node.tagName || "").toLowerCase() === "tr";
+      });
+    }
+
+    function buttonsInside(root, selector) {
+      const found = queryAll(doc, selector);
+      if (!root) return found;
+      const inside = [];
+      for (let i = 0; i < found.length; i += 1) {
+        if (containsNode(root, found[i])) inside.push(found[i]);
+      }
+      return inside;
+    }
+
+    function addButtonIn(root) {
+      const found = buttonsInside(root, selectors["add-comment-button"]);
       if (found.length) return found[found.length - 1];
-      const named = buttonsNamed(doc, "+");
+      const named = buttonsInside(root, "button, [role='button']").filter(function (el) {
+        const name = accessibleName(el);
+        return name === "+" || name === "Add comment";
+      });
       return named.length ? named[named.length - 1] : null;
+    }
+
+    async function findAddButton(cell) {
+      const row = rowOf(cell);
+      if (cell && typeof cell.scrollIntoView === "function") {
+        try {
+          cell.scrollIntoView({ block: "center", inline: "nearest" });
+        } catch (err) {
+          /* the gutter button can still be in the row */
+        }
+      }
+      const scoped = addButtonIn(row || cell);
+      if (scoped) return scoped;
+      const schedule = typeof req.schedule === "function"
+        ? req.schedule
+        : function (fn, ms) { setTimeout(fn, ms); };
+      await new Promise(function (resolve) { schedule(resolve, 50); });
+      return addButtonIn(row || cell);
     }
 
     function findComposerTextarea() {
@@ -721,7 +766,7 @@
       stopped = true;
     }
 
-    function fillInline(finding, row) {
+    async function fillInline(finding, row) {
       const line = finding.line;
       const cell = reveal(finding, line);
       if (!cell) {
@@ -741,7 +786,7 @@
         activate(other, { shiftKey: true });
       }
       activate(cell, { hover: true });
-      const plus = findAddButton();
+      const plus = await findAddButton(cell);
       if (!plus || !activate(plus)) {
         blockedFinding(finding, row, "fill", "DOM failure. The add comment control was not found.");
         return;

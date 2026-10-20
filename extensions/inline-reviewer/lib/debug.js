@@ -130,6 +130,8 @@
     while (cur) {
       const path = attr(cur, "data-file-path") || attr(cur, "data-path");
       if (path) return path;
+      const label = attr(cur, "aria-label");
+      if (label.indexOf("Diff for: ") === 0) return label.slice("Diff for: ".length).trim();
       cur = cur.parentNode || cur.parentElement || null;
     }
     return "";
@@ -366,7 +368,15 @@
     if (!wanted) return null;
     const files = queryAll(doc, selectors["file-block"]);
     for (let i = 0; i < files.length; i += 1) {
-      if (attr(files[i], "data-file-path") === wanted || attr(files[i], "data-path") === wanted) return files[i];
+      if (attr(files[i], "data-file-path") === wanted) return files[i];
+    }
+    for (let i = 0; i < files.length; i += 1) {
+      if (filePathOf(files[i]) === wanted && attr(files[i], "aria-label").indexOf("Diff for: ") === 0) {
+        return files[i];
+      }
+    }
+    for (let i = 0; i < files.length; i += 1) {
+      if (attr(files[i], "data-path") === wanted) return files[i];
     }
     return null;
   }
@@ -471,6 +481,188 @@
   function selectorMap(request) {
     const packed = request && request.selectors && typeof request.selectors === "object" ? request.selectors : {};
     return packed;
+  }
+
+  const NAV_SELECTOR_DEFAULTS = {
+    "file-block": "[data-file-path], [data-path], table[aria-label^='Diff for: ']",
+    "file-list": "[data-file-list], .diff-line-row, #files, .js-diff-container",
+    "line-number": "[data-diff-side][data-line-number]",
+    "expand-file": "[data-expand-file], [aria-label='Toggle diff contents']",
+    "expand-hunk": "[data-expand-hunk], [aria-label='Expand Down'], [aria-label='Expand Up']",
+    "file-filter": "[data-file-filter], [aria-label='File filter']",
+  };
+
+  function effectiveNavSelectors(request) {
+    const packed = selectorMap(request);
+    const out = {};
+    const keys = Object.keys(NAV_SELECTOR_DEFAULTS);
+    for (let i = 0; i < keys.length; i += 1) {
+      const key = keys[i];
+      out[key] = packed[key] || NAV_SELECTOR_DEFAULTS[key];
+    }
+    return out;
+  }
+
+  function pullChangesPath(pathname) {
+    const path = String(pathname == null ? "" : pathname);
+    return /\/pull\/\d+\/(changes|files)\/?$/.test(path);
+  }
+
+  function diffContentRoot(doc) {
+    if (!doc || typeof doc.querySelector !== "function") return null;
+    return (
+      doc.querySelector('[data-testid="diff-content"]') ||
+      doc.querySelector('[data-testid="progressive-diffs-list"]') ||
+      doc.getElementById("files") ||
+      doc.querySelector(".js-diff-container")
+    );
+  }
+
+  function comparisonViewer(doc) {
+    if (!doc) return null;
+    if (typeof doc.getElementById === "function") {
+      const byId = doc.getElementById("diff-comparison-viewer-container");
+      if (byId) return byId;
+    }
+    if (typeof doc.querySelector === "function") {
+      return doc.querySelector("#diff-comparison-viewer-container");
+    }
+    return null;
+  }
+
+  function positionComparisonViewer(viewer, target, align) {
+    if (!viewer || !target) return false;
+    if (typeof viewer.getBoundingClientRect !== "function" || typeof target.getBoundingClientRect !== "function") {
+      return false;
+    }
+    let viewerBox;
+    let targetBox;
+    try {
+      viewerBox = viewer.getBoundingClientRect();
+      targetBox = target.getBoundingClientRect();
+    } catch (err) {
+      return false;
+    }
+    if (!viewerBox || !targetBox) return false;
+    const delta = Number(targetBox.top) - Number(viewerBox.top);
+    if (!Number.isFinite(delta)) return false;
+    const current = Number(viewer.scrollTop);
+    const base = Number.isFinite(current) ? current : 0;
+    let next = base + delta;
+    if (align !== "start") {
+      const viewHeight = Number(viewer.clientHeight);
+      const height =
+        Number.isFinite(viewHeight) && viewHeight > 0
+          ? viewHeight
+          : Number(viewerBox.bottom) - Number(viewerBox.top);
+      const targetHeight = Number(targetBox.bottom) - Number(targetBox.top);
+      if (Number.isFinite(height) && height > 0) {
+        const span = Number.isFinite(targetHeight) ? targetHeight : 0;
+        next = base + delta - Math.max(0, (height - span) / 2);
+      }
+    }
+    if (!Number.isFinite(next)) return false;
+    viewer.scrollTop = next < 0 ? 0 : next;
+    return true;
+  }
+
+  function scrollDiffPane(doc, selectors) {
+    const viewer = comparisonViewer(doc);
+    if (viewer) {
+      const current = Number(viewer.scrollTop);
+      viewer.scrollTop = (Number.isFinite(current) ? current : 0) + 900;
+      return true;
+    }
+    const roots = [
+      diffContentRoot(doc),
+      queryAll(doc, selectors["file-list"])[0],
+    ];
+    for (let i = 0; i < roots.length; i += 1) {
+      const target = roots[i];
+      if (target && typeof target.scrollBy === "function") {
+        target.scrollBy(0, 900);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function expandFileForPath(doc, path, selectors) {
+    const file = findFile(doc, path, selectors);
+    if (!file || !isCollapsed(file)) return;
+    const buttons = queryAll(doc, selectors["expand-file"]);
+    for (let i = 0; i < buttons.length; i += 1) {
+      if (containsNode(file, buttons[i])) {
+        dispatch(buttons[i], "click");
+        return;
+      }
+    }
+  }
+
+  function revealLineCell(doc, path, side, line, selectors) {
+    let cell = findLine(doc, path, side, line, selectors);
+    if (cell) return cell;
+    expandFileForPath(doc, path, selectors);
+    cell = findLine(doc, path, side, line, selectors);
+    if (cell) return cell;
+    for (let i = 0; i < 14; i += 1) {
+      scrollDiffPane(doc, selectors);
+      cell = findLine(doc, path, side, line, selectors);
+      if (cell) return cell;
+    }
+    return null;
+  }
+
+  function revealFileTarget(doc, path, selectors) {
+    expandFileForPath(doc, path, selectors);
+    let target = findFile(doc, path, selectors);
+    if (target) return target;
+    for (let i = 0; i < 14; i += 1) {
+      scrollDiffPane(doc, selectors);
+      target = findFile(doc, path, selectors);
+      if (target) return target;
+    }
+    return null;
+  }
+
+  function clearDiffHash(loc) {
+    const scope = loc || globalThis.location;
+    if (!scope || typeof scope.hash !== "string" || scope.hash.indexOf("#diff-") !== 0) return;
+    const next = String(scope.pathname || "") + String(scope.search || "");
+    try {
+      const history = globalThis.history;
+      if (history && typeof history.replaceState === "function") {
+        history.replaceState(history.state, "", next);
+      }
+    } catch (err) {
+      /* leave the hash in place */
+    }
+  }
+
+  function placeTarget(doc, target, align) {
+    const viewer = comparisonViewer(doc);
+    if (!viewer) return false;
+    return positionComparisonViewer(viewer, target, align);
+  }
+
+  function navigateToLine(request) {
+    const req = request || {};
+    const doc = pageDocument(req);
+    const loc = req.location || globalThis.location;
+    if (!doc || !loc || !pullChangesPath(loc.pathname)) {
+      return { ok: false, reason: "wrong_page", readOnly: true };
+    }
+    const path = req.path == null ? "" : String(req.path).trim();
+    const selectors = effectiveNavSelectors(req);
+    const target = path ? revealFileTarget(doc, path, selectors) : null;
+    if (!target) {
+      return { ok: false, reason: "line_off_screen", readOnly: true };
+    }
+    clearDiffHash(loc);
+    if (!placeTarget(doc, target, "start")) {
+      return { ok: false, reason: "line_off_screen", readOnly: true };
+    }
+    return { ok: true, scrolled: true, readOnly: true, fileOnly: true };
   }
 
   function probe(request) {
@@ -578,5 +770,6 @@
     formatDebugBundle: formatDebugBundle,
     copyDebugBundle: copyDebugBundle,
     probe: probe,
+    navigateToLine: navigateToLine,
   };
 });

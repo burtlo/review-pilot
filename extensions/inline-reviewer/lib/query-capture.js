@@ -108,6 +108,31 @@
     return { captured: null, repo: parseGitHubRepo(href) };
   }
 
+  function rankPullTabs(tabs, preferredId) {
+    const list = Array.isArray(tabs) ? tabs : [];
+    let best = null;
+    let bestScore = 0;
+    for (let i = 0; i < list.length; i += 1) {
+      const tab = list[i];
+      if (!tab || typeof tab !== "object") continue;
+      const href = typeof tab.url === "string" && tab.url
+        ? tab.url
+        : typeof tab.pendingUrl === "string"
+          ? tab.pendingUrl
+          : "";
+      if (!parsePullUrl(href)) continue;
+      let score = 1;
+      if (tab.active === true) score += 2;
+      if (tab.focusedWindow === true) score += 1;
+      if (preferredId != null && tab.id === preferredId) score += 8;
+      if (score > bestScore) {
+        best = tab;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
   function pageUrl(captured) {
     const clean = sanitizeCapture(captured);
     if (!clean) return "";
@@ -132,6 +157,7 @@
     mergeCapture: mergeCapture,
     resolveTabCapture: resolveTabCapture,
     describeTab: describeTab,
+    rankPullTabs: rankPullTabs,
     pageUrl: pageUrl,
   };
 });

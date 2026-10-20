@@ -104,6 +104,23 @@ test("packaged selectors include the head commit link", () => {
   assert.notEqual(PREFIXED, SHORT);
 });
 
+test("the new GitHub changes page reads head SHA from embedded payload", () => {
+  const gate = gateFrom("range-new-changes.html");
+  assert.equal(gate.status, "pass");
+  assert.equal(gate.observedRange, "All commits");
+  assert.equal(gate.observedHead, HEAD);
+  assert.equal(gate.whitespaceHidden, false);
+});
+
+test("the new changes page passes when whitespace UI and preference are absent", () => {
+  const gate = gateFrom("range-new-changes-no-whitespace-pref.html");
+  assert.equal(gate.status, "pass");
+  assert.equal(gate.observedRange, "All commits");
+  assert.equal(gate.observedHead, HEAD);
+  assert.equal(gate.whitespaceHidden, false);
+  assert.match(gate.log, /SHA gate passed/);
+});
+
 test("the gate passes only for All commits, visible whitespace, and the full SHA", async () => {
   const fixture = read("range-all-commits.html");
   assert.ok(fixture.includes(HEAD));

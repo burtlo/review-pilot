@@ -107,6 +107,27 @@ def test_ensure_checkout_reuses_dest_when_sha_matches(tmp_path: Path):
     assert runner.calls == [["git", "rev-parse", "HEAD"]]
 
 
+def test_add_worktree_prunes_stale_registration_and_retries(tmp_path: Path):
+    source = tmp_path / "repo"
+    source.mkdir()
+    _git(source, "init", "-b", "main")
+    _git(source, "config", "user.email", "review@example.com")
+    _git(source, "config", "user.name", "Reviewer")
+    (source / "README.md").write_text("one\n", encoding="utf-8")
+    _git(source, "add", "README.md")
+    _git(source, "commit", "-m", "one")
+    sha = _git(source, "rev-parse", "HEAD").strip()
+    dest = tmp_path / "review-checkout"
+    add_worktree(SubprocessRunner(), "git", source, dest, sha)
+    import shutil
+
+    shutil.rmtree(dest)
+
+    add_worktree(SubprocessRunner(), "git", source, dest, sha)
+    assert dest.is_dir()
+    assert _git(dest, "rev-parse", "HEAD").strip() == sha
+
+
 def test_ensure_checkout_refuses_mismatched_existing_dest(tmp_path: Path):
     source = tmp_path / "org-clone"
     source.mkdir()

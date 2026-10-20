@@ -142,7 +142,11 @@ class App:
 
     def write(self, text: str) -> None:
         assert self.stdout is not None
-        self.stdout.write(text)
+        try:
+            self.stdout.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(self.stdout, "encoding", None) or "utf-8"
+            self.stdout.buffer.write(text.encode(encoding, errors="replace"))
 
     def error(self, text: str) -> None:
         assert self.stderr is not None

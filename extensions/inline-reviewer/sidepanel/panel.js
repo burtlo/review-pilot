@@ -14,8 +14,18 @@
   let debugLog = [];
 
   function activeTab() {
-    return chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(function (tabs) {
-      return tabs[0] || null;
+    return chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }).then(function (windows) {
+      const tabs = [];
+      (windows || []).forEach(function (win) {
+        (win.tabs || []).forEach(function (tab) {
+          tabs.push(Object.assign({}, tab, { focusedWindow: win.focused === true }));
+        });
+      });
+      const ranked = globalThis.ReviewPilotQuery && ReviewPilotQuery.rankPullTabs(tabs, null);
+      if (ranked) return ranked;
+      return chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(function (fallback) {
+        return fallback[0] || null;
+      });
     });
   }
 
@@ -195,7 +205,55 @@
     });
   });
 
+  function navigateFindingLink(link, openFallback) {
+    const anchor = link.getAttribute("data-diff-anchor");
+    if (!anchor) return Promise.resolve(false);
+    return activeTab().then(function (tab) {
+      if (!tab || tab.id == null) return false;
+      return new Promise(function (resolve) {
+        try {
+          chrome.tabs.sendMessage(
+            tab.id,
+            {
+              type: "navigate-to-anchor",
+              anchor: anchor,
+              path: link.getAttribute("data-finding-path") || "",
+              line: link.getAttribute("data-finding-line") || "",
+              side: link.getAttribute("data-finding-side") || "RIGHT",
+              on_diff: link.getAttribute("data-on-diff") === "true",
+            },
+            function (response) {
+              if (!chrome.runtime.lastError && response && response.ok) {
+                resolve(true);
+                return;
+              }
+              if (openFallback) {
+                const href = link.getAttribute("data-fallback-href");
+                if (href) chrome.tabs.update(tab.id, { url: href });
+              }
+              resolve(false);
+            }
+          );
+        } catch (err) {
+          resolve(false);
+        }
+      });
+    });
+  }
+
   statusEl.addEventListener("click", async function (event) {
+    const lineLink = event.target && event.target.closest ? event.target.closest(".finding-line-link") : null;
+    if (lineLink) {
+      event.preventDefault();
+      const openFallback = event.metaKey === true || event.ctrlKey === true || event.button === 1;
+      if (openFallback) {
+        const href = lineLink.getAttribute("data-fallback-href");
+        if (href) chrome.tabs.create({ url: href });
+        return;
+      }
+      await navigateFindingLink(lineLink, true);
+      return;
+    }
     const dryRunButton = event.target && event.target.closest ? event.target.closest("[data-dry-run-finding]") : null;
     if (dryRunButton) {
       runPrepare({

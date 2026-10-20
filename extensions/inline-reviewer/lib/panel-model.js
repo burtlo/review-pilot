@@ -17,7 +17,8 @@
     "bridge-unreachable":
       "Could not reach the local bridge. Start review-ticket serve-inline-review with REVIEW_PILOT_BRIDGE_TOKEN set in that process.",
     unauthorized: "The bridge rejected the shared secret.",
-    "not-found": "The bridge has no snapshot for this pull request and reviewed SHA.",
+    "not-found": "No automated review found for this pull request.",
+    "not-found-sha": "The bridge has no snapshot for this pull request and reviewed SHA.",
     "bad-json": "The bridge returned a response that was not a snapshot.",
   };
 
@@ -54,6 +55,32 @@
     return REASONS[reason] || "The snapshot could not be loaded.";
   }
 
+  function blockedReason(plan, captured) {
+    const reason = plan && plan.reason;
+    if (reason === "not-found" && captured && String(captured.sha || "").trim()) return "not-found-sha";
+    return reason;
+  }
+
+  function shortSha(sha) {
+    const text = String(sha || "");
+    return text.length > 12 ? text.slice(0, 12) : text;
+  }
+
+  function ambiguityWarning(snapshot) {
+    if (!snapshot || typeof snapshot.candidate_count !== "number" || snapshot.candidate_count <= 1) {
+      return "";
+    }
+    const issue = snapshot.resolved_issue == null ? snapshot.issue : snapshot.resolved_issue;
+    const sha = snapshot.resolved_sha == null ? snapshot.sha : snapshot.resolved_sha;
+    return (
+      "Multiple automated reviews exist for this pull request. Showing the newest on disk (" +
+      String(issue == null ? "" : issue) +
+      " @ " +
+      shortSha(sha) +
+      "). Open the link from the ticket you are reviewing to pin issue and SHA."
+    );
+  }
+
   function presentFinding(finding, placement) {
     if (!finding || typeof finding !== "object") return null;
     const placed = placement && typeof placement === "object" ? placement : {};
@@ -80,6 +107,33 @@
     return finding.path;
   }
 
+  function pathLineHtml(model, finding) {
+    const text = pathLine(finding);
+    if (!text) return "";
+    const anchorApi = globalThis.ReviewPilotDiffAnchor;
+    const anchorId =
+      anchorApi && typeof anchorApi.lineAnchorId === "function" ? anchorApi.lineAnchorId(finding) : "";
+    if (!anchorId) return escapeHtml(text);
+    const fallback =
+      anchorApi && typeof anchorApi.lineHref === "function" ? anchorApi.lineHref(model, finding) : "";
+    const pathAttr = finding.path ? ' data-finding-path="' + escapeHtml(String(finding.path)) + '"' : "";
+    const sideAttr = finding.side ? ' data-finding-side="' + escapeHtml(String(finding.side)) + '"' : "";
+    const title = "Go to file on this pull request";
+    return (
+      '<a class="finding-line-link" href="#" data-diff-anchor="' +
+      escapeHtml(anchorId) +
+      '" data-on-diff="false"' +
+      pathAttr +
+      sideAttr +
+      (fallback ? ' data-fallback-href="' + escapeHtml(fallback) + '"' : "") +
+      ' title="' +
+      escapeHtml(title) +
+      '">' +
+      escapeHtml(text) +
+      "</a>"
+    );
+  }
+
   function placementLabel(finding) {
     return finding.on_diff ? "inline" : "not on the current diff";
   }
@@ -103,7 +157,7 @@
     if (!plan.ok || !source.snapshot) {
       return {
         mode: "blocked",
-        message: messageForReason(plan.ok ? "bad-json" : plan.reason, plan.status),
+        message: messageForReason(plan.ok ? "bad-json" : blockedReason(plan, captured), plan.status),
         issue: "",
         pr: "",
         sha: "",
@@ -126,6 +180,7 @@
       issue: snapshot.issue == null ? "" : String(snapshot.issue),
       pr: snapshot.pr == null ? "" : String(snapshot.pr),
       sha: snapshot.sha == null ? "" : String(snapshot.sha),
+      ambiguity: ambiguityWarning(snapshot),
       findings: findings,
       gate: source.gate && typeof source.gate === "object" ? source.gate : null,
       activity: Array.isArray(source.activity)
@@ -254,7 +309,7 @@
           '</td><td class="finding-title">' +
           escapeHtml(finding.title) +
           '</td><td class="finding-place">' +
-          escapeHtml(pathLine(finding)) +
+          pathLineHtml(model, finding) +
           '</td><td class="finding-kind">' +
           escapeHtml(placementLabel(finding)) +
           '</td><td class="finding-status">' +
@@ -290,7 +345,11 @@
       "</dd>" +
       '<dt>Reviewed SHA</dt><dd class="sha">' +
       escapeHtml(model.sha) +
-      "</dd></dl><h2>Findings</h2>" +
+      "</dd></dl>" +
+      (model.ambiguity
+        ? '<p class="banner ambiguity" data-ambiguity="multiple">' + escapeHtml(model.ambiguity) + "</p>"
+        : "") +
+      "<h2>Findings</h2>" +
       list +
       "</div>"
     );

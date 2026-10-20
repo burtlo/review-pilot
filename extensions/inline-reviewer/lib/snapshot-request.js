@@ -43,7 +43,8 @@
     url.searchParams.set("owner", parts.owner);
     url.searchParams.set("repo", parts.repo);
     url.searchParams.set("number", String(parts.number));
-    url.searchParams.set("sha", parts.sha);
+    if (parts.issue) url.searchParams.set("issue", parts.issue);
+    if (parts.sha) url.searchParams.set("sha", parts.sha);
     return url.toString();
   }
 
@@ -66,7 +67,6 @@
       return { ok: false, reason: "not-allowlisted", owner: repo.owner, repo: repo.repo };
     }
     if (!captured) return { ok: false, reason: "missing-pr" };
-    if (!captured.sha) return { ok: false, reason: "missing-sha" };
     if (!settings.token) return { ok: false, reason: "missing-token" };
     if (settings.port == null) return { ok: false, reason: "bad-port" };
     return {
@@ -76,6 +76,7 @@
         owner: captured.owner,
         repo: captured.repo,
         number: captured.number,
+        issue: captured.issue,
         sha: captured.sha,
       }),
       headers: {

@@ -49,10 +49,10 @@ def main(
     stdout=None,
     stderr=None,
 ) -> int:
-    parser = build_parser()
     try:
-        args = parser.parse_args(argv)
-        require_issue_key(args.issue)
+        args = parse_cli(argv)
+        if args.command != "serve-inline-review":
+            require_issue_key(args.issue)
     except ValueError as exc:
         print(str(exc), file=stderr or sys.stderr)
         return 2
@@ -80,8 +80,10 @@ def main(
 
 
 def dispatch(app: App, args: argparse.Namespace) -> StepResult:
-    issue = args.issue
     command = args.command
+    if command == "serve-inline-review":
+        return _serve_inline_review(app, args)
+    issue = args.issue
     if command is None:
         return resume(app, issue)
     if command == "status":
@@ -102,8 +104,6 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
         return import_review(app, issue, Path(args.file), revise=args.revise)
     if command == "attach":
         return run_review_attach(app, issue, revise=args.revise)
-    if command == "serve-inline-review":
-        return _serve_inline_review(app, issue, args)
     if command == "review":
         return _review(app, issue, args)
     if command == "publish-review":
@@ -137,10 +137,11 @@ def dispatch(app: App, args: argparse.Namespace) -> StepResult:
     raise WorkflowError(f"Unknown command {command}.")
 
 
-def _serve_inline_review(app: App, issue: str, args: argparse.Namespace) -> StepResult:
-    server = serve_inline_review(app.store, issue, pr=args.pr, sha=args.sha, port=args.port)
+def _serve_inline_review(app: App, args: argparse.Namespace) -> StepResult:
+    server = serve_inline_review(app.store, port=args.port)
     host, port = server.server_address[:2]
     app.write(f"Serving inline review at http://{host}:{port}/snapshot\n")
+    app.write(f"Reviews directory: {app.store.root}\n")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -349,10 +350,66 @@ def _add_refresh_to_subparsers(parser: argparse.ArgumentParser) -> None:
             _add_refresh_to_subparsers(sub_parser)
 
 
+def parse_cli(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse ``review-ticket`` arguments.
+
+    ``serve-inline-review`` is global: it does not take a Jira issue. Every other
+    command still requires ``review-ticket <issue> …``.
+    """
+
+    raw = sys.argv[1:] if argv is None else list(argv)
+    serve_flags = _serve_inline_review_flags(raw)
+    if serve_flags is not None:
+        args = build_serve_parser().parse_args(serve_flags)
+        args.command = "serve-inline-review"
+        args.issue = None
+        return args
+    return build_parser().parse_args(raw)
+
+
+def _serve_inline_review_flags(argv: list[str]) -> list[str] | None:
+    """Flags after a leading ``serve-inline-review``, or None for an issue command."""
+
+    flags: list[str] = []
+    command_seen = False
+    for token in argv:
+        if not command_seen:
+            if token.startswith("-"):
+                flags.append(token)
+                continue
+            if token != "serve-inline-review":
+                return None
+            command_seen = True
+            continue
+        flags.append(token)
+    if not command_seen:
+        return None
+    return flags
+
+
+def build_serve_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="review-ticket serve-inline-review",
+        description=(
+            "Serve automated review snapshots from the configured reviews directory "
+            "on 127.0.0.1. reviews_dir comes from .review-ticket.yaml when set; "
+            "otherwise the reviews directory next to the working directory is used."
+        ),
+    )
+    parser.add_argument("--port", type=int, default=DEFAULT_BRIDGE_PORT)
+    _add_refresh_flag(parser)
+    return parser
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="review-ticket",
         description="Manual peer review from a Jira issue through GitHub feedback and local testing.",
+        epilog=(
+            "Global command, with no issue argument: "
+            "review-ticket serve-inline-review [--port PORT]. "
+            "It reads reviews_dir from configuration (default: ./reviews)."
+        ),
     )
     parser.add_argument("issue", help="Jira issue id, for example DOTNETIOT-1234")
     _add_refresh_flag(parser)
@@ -378,14 +435,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     attach = sub.add_parser("attach", help="Open the Textual review UI")
     attach.add_argument("--revise", action="store_true")
-
-    serve = sub.add_parser(
-        "serve-inline-review",
-        help="Serve one reviewed snapshot on 127.0.0.1 for the inline reviewer",
-    )
-    serve.add_argument("--pr", help="owner/repo#number (default: the active pull request)")
-    serve.add_argument("--sha", help="Reviewed commit (default: pr_shas for that pull request)")
-    serve.add_argument("--port", type=int, default=DEFAULT_BRIDGE_PORT)
 
     review = sub.add_parser("review", help="Inspect or record the human review")
     review_sub = review.add_subparsers(dest="review_cmd", required=True)

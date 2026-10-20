@@ -9,6 +9,7 @@ const {
   describeTab,
   mergeCapture,
   pageUrl,
+  rankPullTabs,
 } = require("../lib/query-capture.js");
 const { contentScriptMessage } = require("../lib/messages.js");
 
@@ -106,4 +107,25 @@ test("conversation and non-GitHub pages do not keep a files capture", () => {
   });
   assert.equal(describeTab(stored, "https://example.com/owner/repo/pull/4/changes").captured, null);
   assert.equal(describeTab(stored, "https://example.com/owner/repo/pull/4/changes").repo, null);
+});
+
+test("rankPullTabs prefers the requested pull request tab over another window", () => {
+  const changes = "https://github.com/kwik-trip-iot/KT.IoT.UI.Admin/pull/354/changes?review_pilot_sha=abc";
+  const ranked = rankPullTabs(
+    [
+      { id: 1, active: true, focusedWindow: true, url: "https://github.com/kwik-trip-iot/KT.IoT.UI.Admin" },
+      { id: 2, active: true, focusedWindow: false, url: changes },
+      { id: 3, active: true, focusedWindow: true, url: "https://example.com/" },
+    ],
+    2
+  );
+  assert.equal(ranked.id, 2);
+  const fallback = rankPullTabs(
+    [
+      { id: 4, active: false, focusedWindow: false, url: changes },
+      { id: 5, active: true, focusedWindow: true, url: "chrome://extensions/" },
+    ],
+    5
+  );
+  assert.equal(fallback.id, 4);
 });

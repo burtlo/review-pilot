@@ -29,8 +29,23 @@ def rev_parse(runner: Runner, git: str, repo: Path) -> str:
 
 
 def add_worktree(runner: Runner, git: str, source: Path, dest: Path, sha: str) -> None:
+    dest = dest.absolute()
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _run(runner, [git, "worktree", "add", "--detach", str(dest), sha], cwd=source)
+    argv = [git, "worktree", "add", "--detach", str(dest), sha]
+    result = runner.run(argv, cwd=str(source))
+    if result.returncode == 0:
+        return
+    detail = (result.stderr or result.stdout or "").strip()
+    lowered = detail.casefold()
+    if "already exists" in lowered or "already registered worktree" in lowered:
+        _LOG.info("worktree add failed (%s); pruning stale registrations and retrying", dest)
+        _run(runner, [git, "worktree", "prune"], cwd=source)
+        _run(runner, argv, cwd=source)
+        return
+    raise ToolError(
+        f"Command failed ({result.returncode}): {' '.join(argv)}\n{detail}",
+        returncode=result.returncode,
+    )
 
 
 def ensure_checkout(
@@ -45,6 +60,7 @@ def ensure_checkout(
     """Check out ``sha`` in ``dest``. Reuse the directory when it already matches."""
 
     git = config.git_bin
+    dest = dest.absolute()
     if dest.exists():
         head = rev_parse(runner, git, dest)
         if head != sha:

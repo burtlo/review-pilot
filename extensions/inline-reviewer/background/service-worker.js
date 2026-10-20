@@ -130,61 +130,181 @@ async function registryState() {
   }
 }
 
-function requestRangeReading(tabId, selectors) {
+function sendTabMessage(tabId, message) {
   return new Promise(function (resolve) {
     try {
-      chrome.tabs.sendMessage(
-        tabId,
-        {
-          type: "read-range-gate",
-          selectors: selectors,
-          timeoutMs: ReviewPilotShaGate.HYDRATION_TIMEOUT_MS,
-        },
-        function (response) {
-          if (chrome.runtime.lastError || !response) {
-            resolve(null);
-            return;
-          }
-          resolve(response.reading || null);
+      chrome.tabs.sendMessage(tabId, message, function (response) {
+        const err = chrome.runtime.lastError;
+        if (err || !response) {
+          resolve({
+            ok: false,
+            error: err ? String(err.message || err) : "empty response",
+          });
+          return;
         }
-      );
+        resolve({ ok: true, response: response });
+      });
     } catch (err) {
-      resolve(null);
+      resolve({ ok: false, error: String(err && err.message ? err.message : err) });
     }
   });
 }
 
+function missingReceiver(error) {
+  return /Receiving end does not exist|Could not establish connection/i.test(String(error || ""));
+}
+
+async function injectContentScripts(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") return false;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      files: [
+        "lib/query-capture.js",
+        "lib/placement.js",
+        "lib/sha-gate.js",
+        "lib/prepare.js",
+        "lib/debug.js",
+        "lib/diff-nav.js",
+        "content/content-script.js",
+      ],
+    });
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+async function readRootInTab(tabId, selectors) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    return { reading: null, error: "scripting unavailable" };
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      files: ["lib/sha-gate.js"],
+    });
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      args: [selectors],
+      func: function (packed) {
+        try {
+          const api = globalThis.ReviewPilotShaGate;
+          if (!api || typeof api.readRoot !== "function") return null;
+          return api.readRoot(document, packed);
+        } catch (err) {
+          return null;
+        }
+      },
+    });
+    const value = results && results[0] ? results[0].result : null;
+    if (!value || typeof value !== "object") return { reading: null, error: "empty script result" };
+    return { reading: value, error: "" };
+  } catch (err) {
+    return { reading: null, error: String(err && err.message ? err.message : err) };
+  }
+}
+
+async function requestRangeReading(tabId, selectors) {
+  const direct = await readRootInTab(tabId, selectors);
+  if (direct.reading && direct.reading.hydrated) return direct;
+  let messaged = await sendTabMessage(tabId, {
+    type: "read-range-gate",
+    selectors: selectors,
+    timeoutMs: ReviewPilotShaGate.HYDRATION_TIMEOUT_MS,
+  });
+  if (!messaged.ok && missingReceiver(messaged.error)) {
+    if (await injectContentScripts(tabId)) {
+      messaged = await sendTabMessage(tabId, {
+        type: "read-range-gate",
+        selectors: selectors,
+        timeoutMs: ReviewPilotShaGate.HYDRATION_TIMEOUT_MS,
+      });
+    }
+  }
+  if (messaged.ok && messaged.response && messaged.response.reading) {
+    const waited = messaged.response.reading;
+    if (!direct.reading || waited.hydrated) return { reading: waited, error: "" };
+  }
+  if (direct.reading) return direct;
+  return { reading: null, error: (messaged && messaged.error) || direct.error || "no range reading" };
+}
+
+async function listNormalTabs() {
+  const windows = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
+  const tabs = [];
+  for (let i = 0; i < windows.length; i += 1) {
+    const win = windows[i];
+    const found = win && win.tabs ? win.tabs : [];
+    for (let j = 0; j < found.length; j += 1) {
+      tabs.push(Object.assign({}, found[j], { focusedWindow: win.focused === true }));
+    }
+  }
+  return tabs;
+}
+
+async function resolvePullTabId(preferredId) {
+  try {
+    const ranked = ReviewPilotQuery.rankPullTabs(await listNormalTabs(), preferredId);
+    if (ranked && Number.isInteger(ranked.id)) return ranked.id;
+  } catch (err) {
+    /* keep the caller's tab */
+  }
+  return Number.isInteger(preferredId) ? preferredId : null;
+}
+
 async function readGateForSnapshot(tabId, context) {
+  const ctx = context && typeof context === "object" ? context : {};
+  let tabUrl = "";
+  if (Number.isInteger(tabId)) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      tabUrl = tab && tab.url ? String(tab.url) : "";
+    } catch (err) {
+      tabUrl = "";
+    }
+  }
   let selectors = null;
+  let selectorError = "";
   if (Number.isInteger(tabId)) {
     try {
       selectors = await loadSelectors();
     } catch (err) {
       selectors = null;
+      selectorError = "selectors.json did not load";
     }
   }
   let reading = null;
-  if (selectors) reading = await requestRangeReading(tabId, selectors);
-  return ReviewPilotShaGate.evaluate(reading, context);
+  let pageNote = "";
+  if (!Number.isInteger(tabId)) {
+    pageNote = "No pull request Files changed tab was found.";
+  } else if (!selectors) {
+    pageNote = selectorError || "Selectors did not load.";
+  } else {
+    const result = await requestRangeReading(tabId, selectors);
+    reading = result.reading;
+    if (!reading) {
+      pageNote = "The pull request page did not return a range reading" +
+        (result.error ? " (" + result.error + ")" : "") +
+        ".";
+    }
+  }
+  return ReviewPilotShaGate.evaluate(reading, Object.assign({}, ctx, {
+    tabUrl: tabUrl,
+    pageNote: pageNote,
+  }));
 }
 
-function requestPagePrepare(tabId, payload) {
-  return new Promise(function (resolve) {
-    try {
-      chrome.tabs.sendMessage(tabId, payload, function (response) {
-        if (chrome.runtime.lastError || !response) {
-          resolve(null);
-          return;
-        }
-        resolve(response);
-      });
-    } catch (err) {
-      resolve(null);
-    }
-  });
+async function requestPagePrepare(tabId, payload) {
+  let result = await sendTabMessage(tabId, payload);
+  if (!result.ok && missingReceiver(result.error) && (await injectContentScripts(tabId))) {
+    result = await sendTabMessage(tabId, payload);
+  }
+  return result.ok ? result.response : null;
 }
 
 async function prepareForTab(tabId, message) {
+  tabId = await resolvePullTabId(tabId);
   const incoming = message && typeof message === "object" ? message : {};
   const scanOptions = {};
   if (typeof incoming.replaceModifiedDrafts === "boolean") {
@@ -279,6 +399,7 @@ async function prepareForTab(tabId, message) {
 }
 
 async function probeForTab(tabId, message) {
+  tabId = await resolvePullTabId(tabId);
   const incoming = message && typeof message === "object" ? message : {};
   let selectors = null;
   try {
@@ -323,6 +444,7 @@ async function probeForTab(tabId, message) {
 }
 
 async function pickForTab(tabId, selectorId) {
+  tabId = await resolvePullTabId(tabId);
   let defaults = null;
   try {
     defaults = await loadPackagedSelectors();
@@ -369,6 +491,7 @@ function collectFromTab(tabId) {
 }
 
 async function panelState(tabId, scanOptions) {
+  tabId = await resolvePullTabId(tabId);
   const settings = await readSettings();
   const options = scanOptions || {};
   let liveUrl = "";

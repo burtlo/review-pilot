@@ -41,7 +41,8 @@ button {
   border: 1px solid var(--line);
 }
 
-.banner[data-state="idle"] {
+.banner[data-state="idle"],
+.banner.ambiguity {
   background: var(--idle);
 }
 
@@ -58,6 +59,11 @@ dt {
 
 dd {
   margin: 0;
+}
+
+.finding-place .finding-line-link {
+  color: var(--link-color, #0969da);
+  text-decoration: underline;
 }
 
 .sha, .finding-id, .finding-place {

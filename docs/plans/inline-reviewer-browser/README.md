@@ -7,6 +7,7 @@ Status: **implementation map ready** — spec approved 2026-10-19.
 | [spec.md](spec.md) | Approved feature specification (2026-10-19) |
 | [github-files-changed.md](github-files-changed.md) | Observed Files changed UI: logged out, author, and non-author (2026-10-19) |
 | [implementation.md](implementation.md) | **Canonical** — deltas, work packages (P1–P7), verifier hooks, build order |
+| [path-line-navigation-feedback.md](path-line-navigation-feedback.md) | Parked 2026-10-19: in-panel clicks scroll to the file; line navigation failed |
 
 ## Summary
 

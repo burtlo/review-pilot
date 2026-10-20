@@ -38,6 +38,23 @@
       });
       return true;
     }
+    if (message.type === "navigate-to-anchor") {
+      if (globalThis.ReviewPilotDebug && typeof globalThis.ReviewPilotDebug.navigateToLine === "function") {
+        sendResponse(globalThis.ReviewPilotDebug.navigateToLine(message));
+        return;
+      }
+      if (globalThis.ReviewPilotDiffNav) {
+        sendResponse(
+          globalThis.ReviewPilotDiffNav.navigateToAnchor(message.anchor, {
+            path: message.path,
+            line: message.line,
+            side: message.side,
+            on_diff: message.on_diff,
+          })
+        );
+        return;
+      }
+    }
     if (
       (message.type === "read-range-gate" || message.type === "prepare" || message.type === "dry-run") &&
       globalThis.ReviewPilotShaGate

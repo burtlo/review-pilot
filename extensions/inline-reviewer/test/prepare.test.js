@@ -125,6 +125,28 @@ test("prepare targets data-diff-side and does not submit or change the review ev
   assert.equal(result.actions.some(function (action) { return action.key === "Enter" || action.ctrlKey; }), false);
 });
 
+test("prepare clicks Add comment on the diff table for that file", async () => {
+  const filePath = "KT.IoT.UI.Admin/Helpers/ThingComboBoxReadExecutor.cs";
+  const finding = onDiff("F002", { path: filePath, line: 126 });
+  const decoy = onDiff("F001", {
+    path: "KT.IoT.UI.Admin.E2E.Tests/ThingComboBoxScrollTestHelpers.cs",
+    line: 126,
+  });
+  const page = createPage({
+    findings: [decoy, finding],
+    pathOnAria: true,
+    commentLabel: "Add comment",
+  });
+  const result = await shaGate.prepare(passGate(), page.request({ findingId: "F002", findings: [finding] }));
+  assert.equal(result.status, "pass");
+  assert.equal(result.inserts, 1);
+  assert.equal(page.fired("Add comment", "click"), 1);
+  const lineClick = result.actions.filter(function (action) {
+    return action.type === "click" && action.line === "126";
+  })[0];
+  assert.equal(lineClick.side, "right");
+});
+
 test("Prepare all clicks Start a review and per-finding prepare does not", async () => {
   const finding = onDiff("F001");
   const one = createPage({ findings: [finding], mode: "finding" });

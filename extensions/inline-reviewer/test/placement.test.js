@@ -5,6 +5,7 @@ const path = require("node:path");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const placement = require("../lib/placement.js");
+require("../lib/diff-anchor.js");
 const { panelFromPlan, renderPanelHtml } = require("../lib/panel-model.js");
 
 const root = path.join(__dirname, "..");
@@ -315,6 +316,16 @@ test("the sidebar lists id, title, path:line, inline or not on the current diff,
   assert.match(html, /<th>Placement<\/th>/);
   assert.match(html, /<th>Status<\/th>/);
   assert.match(html, /src\/Example\.cs:142/);
+  assert.match(html, /data-diff-anchor="diff-[0-9a-f]{64}" data-on-diff="false"/);
+  assert.doesNotMatch(html, /data-finding-line=/);
+  assert.doesNotMatch(html, /data-diff-anchor="diff-[0-9a-f]{64}[RL]/);
+  assert.match(html, /title="Go to file on this pull request"/);
+  assert.doesNotMatch(html, /Go to line/);
+  const f002Row = html.match(/<tr class="finding" data-finding-id="F002"[\s\S]*?<\/tr>/);
+  assert.ok(f002Row);
+  assert.match(f002Row[0], /data-diff-anchor="diff-[0-9a-f]{64}" data-on-diff="false"/);
+  assert.doesNotMatch(f002Row[0], /data-diff-anchor="diff-[0-9a-f]{64}R/);
+  assert.match(html, /data-fallback-href="https:\/\/github\.com\/acme\/widgets\/pull\/87\/changes/);
   assert.match(html, />inline</);
   assert.match(html, /not on the current diff/);
   assert.match(html, /published/);
@@ -407,6 +418,7 @@ test("the panel wires refresh scan and does not prepare clicks", () => {
   assert.match(html, /Replace modified drafts/);
   assert.match(html, /id="replace-modified-drafts"/);
   assert.match(panel, /refresh-scan/);
+  assert.match(panel, /rankPullTabs/);
   assert.match(panel, /confirm-replace-draft/);
   assert.match(panel, /replaceModifiedDrafts/);
   assert.match(content, /collect-scan/);

@@ -97,7 +97,12 @@ Without an install, run `python bin/review-ticket` (or `python -m review_ticket`
 
 `.review-ticket.yaml` (or `.review-ticket.yml`) in the working directory is optional. Legacy `.review-ticket.json` is still read if no YAML file exists.
 
+Stored tickets and reviews live under `reviews_dir`. When that key is omitted, review-ticket uses a `reviews` directory in the working directory where the command was started. `review-ticket serve-inline-review` scans that same directory for every issue; it does not take an issue argument.
+
 ```yaml
+# Where tickets and reviews are stored. Default: ./reviews in the working directory.
+# reviews_dir: reviews
+
 # Single repo, or use github_org / github_user instead (see below).
 github_repo: acme/widgets
 # github_org: acme

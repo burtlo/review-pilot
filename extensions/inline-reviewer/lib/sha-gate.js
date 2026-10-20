@@ -347,6 +347,111 @@
     return { headLinkFound: true, headSha: data || hrefSha || "" };
   }
 
+  function isAllCommitsRange(label) {
+    const text = cleanLabel(label);
+    if (text === "All commits") return true;
+    const collapsed = text.replace(/\s+/g, " ").trim();
+    return /^All commits(\s+\d+\s+commits?)?$/.test(collapsed);
+  }
+
+  function readEmbeddedRoute(doc) {
+    if (!doc || typeof doc.querySelector !== "function") return null;
+    const el = doc.querySelector('[data-target="react-app.embeddedData"]');
+    if (!el || !el.textContent) return null;
+    try {
+      const parsed = JSON.parse(el.textContent);
+      const route = parsed && parsed.payload && parsed.payload.pullRequestsChangesRoute;
+      return route && typeof route === "object" ? route : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function rangeLabelFromEmbedded(route) {
+    const viewing = route && route.comparison && route.comparison.viewing;
+    if (viewing === "FULL") return "All commits";
+    return "";
+  }
+
+  function headShaFromEmbedded(route) {
+    if (!route) return "";
+    const fromComparison = normalizeFullSha(
+      route.comparison && route.comparison.fullDiff && route.comparison.fullDiff.headOid
+    );
+    if (fromComparison) return fromComparison;
+    if (!Array.isArray(route.commits) || !route.commits.length) return "";
+    const last = route.commits[route.commits.length - 1];
+    return normalizeFullSha(last && last.oid);
+  }
+
+  function whitespaceFromEmbedded(route) {
+    if (!route) return null;
+    let pref = route.whitespacePreference == null ? "" : String(route.whitespacePreference);
+    if (!pref) {
+      const match = /"whitespacePreference"\s*:\s*"([^"]+)"/.exec(JSON.stringify(route));
+      if (!match) return null;
+      pref = match[1];
+    }
+    if (pref === "always_show") return false;
+    if (pref === "ignore_all" || pref === "ignore" || pref === "IGNORE_ALL") return true;
+    return null;
+  }
+
+  function applyEmbeddedFallback(reading, route) {
+    if (!route) return reading;
+    const next = Object.assign({}, reading);
+    if (!next.headSha) {
+      const head = headShaFromEmbedded(route);
+      if (head) {
+        next.headSha = head;
+        next.headLinkFound = true;
+      }
+    }
+    if (!next.rangeLabel) {
+      const range = rangeLabelFromEmbedded(route);
+      if (range) next.rangeLabel = range;
+    }
+    if (next.whitespaceHidden === null) {
+      const hidden = whitespaceFromEmbedded(route);
+      if (hidden !== null) {
+        next.whitespaceHidden = hidden;
+        next.hideControlFound = true;
+      } else if (rangeLabelFromEmbedded(route)) {
+        // New /changes UI often omits hide-whitespace DOM and route.whitespacePreference.
+        next.whitespaceHidden = false;
+      }
+    }
+    if (!next.fileListFound && Array.isArray(route.commits) && route.commits.length) {
+      next.fileListFound = true;
+    }
+    next.hydrated =
+      next.fileListFound &&
+      (next.commitControlFound || Boolean(rangeLabelFromEmbedded(route))) &&
+      cleanLabel(next.rangeLabel) !== "";
+    return next;
+  }
+
+  function headCommitView(doc, selectors) {
+    const scoped = [
+      "details.diffbar-range-menu a[data-commit]",
+      "details.diffbar-range-menu a[href*='/commits/']",
+    ];
+    for (let i = 0; i < scoped.length; i += 1) {
+      try {
+        const view = asView(doc.querySelector(scoped[i]));
+        const head = headFromView(view);
+        if (head.headSha) return view;
+      } catch (err) {
+        /* continue */
+      }
+    }
+    try {
+      return asView(doc.querySelector(selectors["head-commit-link"]));
+    } catch (err) {
+      return null;
+    }
+  }
+
   function readingFromViews(fileView, commitView, hideView, headView) {
     const rangeLabel = elementLabel(commitView);
     const head = headFromView(headView);
@@ -378,7 +483,13 @@
         return null;
       }
     }
-    return readingFromViews(one("file-list"), one("commit-control"), one("hide-whitespace"), one("head-commit-link"));
+    const reading = readingFromViews(
+      one("file-list"),
+      one("commit-control"),
+      one("hide-whitespace"),
+      headCommitView(doc, selectors)
+    );
+    return applyEmbeddedFallback(reading, readEmbeddedRoute(doc));
   }
 
   function readHtml(html, selectors) {
@@ -388,7 +499,28 @@
       function one(key) {
         return asView(firstMatch(rootNode, selectors[key]));
       }
-      return readingFromViews(one("file-list"), one("commit-control"), one("hide-whitespace"), one("head-commit-link"));
+      const reading = readingFromViews(
+        one("file-list"),
+        one("commit-control"),
+        one("hide-whitespace"),
+        one("head-commit-link")
+      );
+      const embeddedEl = firstMatch(rootNode, '[data-target="react-app.embeddedData"]');
+      let route = null;
+      if (embeddedEl && embeddedEl.children) {
+        let text = "";
+        for (let i = 0; i < embeddedEl.children.length; i += 1) {
+          const child = embeddedEl.children[i];
+          if (child.type === "text") text += child.value;
+        }
+        try {
+          const parsed = JSON.parse(text);
+          route = parsed && parsed.payload && parsed.payload.pullRequestsChangesRoute;
+        } catch (err) {
+          route = null;
+        }
+      }
+      return applyEmbeddedFallback(reading, route);
     } catch (err) {
       return emptyReading(true);
     }
@@ -498,6 +630,8 @@
       parts.push("Hide whitespace was not read.");
     }
     if (model.timedOut) parts.push("File list or commit control did not hydrate.");
+    if (model.tabUrl) parts.push("tab " + model.tabUrl + ".");
+    if (model.pageNote) parts.push(String(model.pageNote));
     return (model.pass ? "SHA gate passed." : "Prepare is blocked.") + " " + parts.join(" ");
   }
 
@@ -514,7 +648,7 @@
     const hydrated = source.hydrated === true && source.timedOut !== true;
     const pass =
       hydrated &&
-      observedRange === "All commits" &&
+      isAllCommitsRange(observedRange) &&
       whitespaceHidden === false &&
       Boolean(expectedNorm) &&
       Boolean(observedHead) &&
@@ -529,6 +663,8 @@
       timedOut: source.timedOut === true,
       issue: issue,
       pr: pr,
+      tabUrl: ctx.tabUrl == null ? "" : String(ctx.tabUrl),
+      pageNote: ctx.pageNote == null ? "" : String(ctx.pageNote),
     });
     return {
       status: pass ? "pass" : "blocked",

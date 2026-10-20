@@ -3,7 +3,7 @@
   "name": "Review Pilot Inline Reviewer",
   "version": "0.1.0",
   "description": "Shows a review-ticket snapshot beside GitHub pull request files. Does not publish reviews.",
-  "permissions": ["storage", "sidePanel"],
+  "permissions": ["storage", "sidePanel", "scripting"],
   "host_permissions": [
     "https://github.com/*",
     "http://127.0.0.1/*"
@@ -20,12 +20,9 @@
   "content_scripts": [
     {
       "matches": [
-        "https://github.com/*/*/pull/*/changes",
-        "https://github.com/*/*/pull/*/changes/",
-        "https://github.com/*/*/pull/*/files",
-        "https://github.com/*/*/pull/*/files/"
+        "https://github.com/*"
       ],
-      "js": ["lib/query-capture.js", "lib/placement.js", "lib/sha-gate.js", "lib/prepare.js", "lib/debug.js", "content/content-script.js"],
+      "js": ["lib/query-capture.js", "lib/placement.js", "lib/sha-gate.js", "lib/prepare.js", "lib/debug.js", "lib/diff-nav.js", "content/content-script.js"],
       "run_at": "document_start",
       "all_frames": false
     }
